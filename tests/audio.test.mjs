@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { detectPitch, estimateGender, createVad, encodeWav, resample, rmsDb, concat } from '../audio.js';
+import { detectPitch, estimateGender, createVad, encodeWav, resample, rmsDb, concat, Downsampler } from '../audio.js';
 
 const SR = 16000;
 
@@ -201,4 +201,43 @@ test('VAD: 말 끝나자 배경 소음이 커져도(폰 자동 음량) 문장이
   assert.ok(dur < 3, `dur ${dur}`);
   // 끝난 뒤 커진 소음을 새 말로 오인하지 않음
   assert.equal(ev.filter((e) => e.type === 'start').length, 1, ev.map((e) => e.type).join(','));
+});
+
+const tone48 = (f, sec) => Float32Array.from({ length: Math.round(48000 * sec) }, (_, i) => Math.sin((2 * Math.PI * f * i) / 48000));
+
+test('Downsampler: 말소리 대역(1kHz)은 그대로, 8kHz 넘는 소리는 접혀 들어오지 않음', () => {
+  const pass = new Downsampler(48000).process(tone48(1000, 1)).subarray(200);
+  assert.ok(Math.abs(rmsDb(pass) - -3.01) < 0.3, `1kHz ${rmsDb(pass).toFixed(2)}dB`);
+  // 10kHz 는 16k 변환 뒤 6kHz 로 접혀 들어옴(앨리어싱). 예전 선형 방식과 비교
+  const hi = tone48(10000, 1);
+  const newDb = rmsDb(new Downsampler(48000).process(hi).subarray(200));
+  const oldDb = rmsDb(resample(hi, 48000, 16000).subarray(200));
+  assert.ok(newDb < -50, `새 방식 10kHz 잔여 ${newDb.toFixed(1)}dB`);
+  assert.ok(oldDb > -15, `예전 방식은 ${oldDb.toFixed(1)}dB 로 거의 그대로 섞였음`);
+});
+
+test('Downsampler: 조각으로 나눠 넣어도 한 번에 넣은 것과 같음, 44.1k 도 길이 맞음', () => {
+  const x = Float32Array.from({ length: 48000 }, (_, i) => Math.sin(i / 7) * 0.5 + Math.sin(i / 31) * 0.3);
+  const whole = new Downsampler(48000).process(x);
+  const d = new Downsampler(48000);
+  const parts = concat([0, 2048, 4096, 10000, 30000].map((a, k, arr) => d.process(x.subarray(a, arr[k + 1] ?? x.length))));
+  assert.equal(parts.length, whole.length);
+  let maxDiff = 0;
+  for (let i = 0; i < whole.length; i++) maxDiff = Math.max(maxDiff, Math.abs(whole[i] - parts[i]));
+  assert.ok(maxDiff < 1e-6, `차이 ${maxDiff}`);
+  assert.ok(Math.abs(whole.length - 16000) <= 1);
+  const d44 = new Downsampler(44100);
+  let n = 0;
+  for (let i = 0; i < 44100; i += 2048) n += d44.process(new Float32Array(Math.min(2048, 44100 - i))).length;
+  assert.ok(Math.abs(n - 16000) <= 1, `44.1k → ${n}`);
+});
+
+test('Downsampler: 변환 뒤에도 음높이 판정 유지 (남 110Hz)', () => {
+  const x = Float32Array.from({ length: 48000 }, (_, i) => {
+    const ph = (2 * Math.PI * 110 * i) / 48000;
+    return 0.3 * (Math.sin(ph) + 0.6 * Math.sin(2 * ph) + 0.4 * Math.sin(3 * ph));
+  });
+  const g = estimateGender(new Downsampler(48000).process(x), SR);
+  assert.equal(g.gender, 'male');
+  assert.ok(Math.abs(g.f0 - 110) < 3, `f0 ${g.f0}`);
 });

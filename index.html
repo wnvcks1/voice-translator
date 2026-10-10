@@ -60,7 +60,9 @@ header{display:flex;align-items:center;justify-content:space-between;padding:10p
 .controls{display:flex;justify-content:space-around;align-items:center;padding:12px 16px 8px}
 .ctrl{width:74px;height:74px;border-radius:50%;background:var(--card2);display:grid;place-items:center;font-size:28px}
 .ctrl.big{width:86px;height:86px;font-size:34px}
-.ctrl.big.on{background:#fff;color:#000;box-shadow:0 0 0 6px rgba(255,255,255,.12)}
+.ctrl.big.on{background:#e5484d;color:#fff;box-shadow:0 0 0 6px rgba(229,72,77,.18)}
+.ctrl.muted{background:#fff;color:#000}
+.pill span#pillText{font-variant-numeric:tabular-nums}
 .ctrl:disabled{opacity:.35}
 .ctrl svg{width:32px;height:32px}
 .foot{text-align:center;color:#55555c;font-size:11px;padding-bottom:6px}
@@ -97,7 +99,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:10p
 <body>
 <header>
   <button class="icon-btn" id="btnSettings" aria-label="설정">⋯</button>
-  <div class="pill"><span class="dot" id="liveDot"></span>동시통역</div>
+  <div class="pill"><span class="dot" id="liveDot"></span><span id="pillText">동시통역</span></div>
   <button class="icon-btn" id="btnClear" aria-label="대화 지우기">🗑</button>
 </header>
 
@@ -123,18 +125,18 @@ header{display:flex;align-items:center;justify-content:space-between;padding:10p
 
 <div class="status">
   <div class="bars" id="bars"><i></i><i></i><i></i></div>
-  <p id="statusText">마이크 버튼을 누르면 시작</p>
+  <p id="statusText">가운데 버튼을 누르면 통화(통역) 시작</p>
   <p class="sub" id="statusSub"></p>
 </div>
 
 <div class="controls">
-  <button class="ctrl" id="btnReplay" aria-label="마지막 번역 다시 듣기" disabled>🔁</button>
-  <button class="ctrl big" id="btnMic" aria-label="듣기 시작/정지">
+  <button class="ctrl" id="btnMute" aria-label="음소거" disabled>🎙️</button>
+  <button class="ctrl big" id="btnMic" aria-label="통화 시작">
     <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 1 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"/></svg>
   </button>
   <button class="ctrl" id="btnShow" aria-label="상대에게 크게 보여주기" disabled>🔍</button>
 </div>
-<div class="foot">내용은 AI 가 생성함 · Gemini · v0.3</div>
+<div class="foot">내용은 AI 가 생성함 · Gemini · v0.4</div>
 
 <div id="show">
   <div class="big" id="showBig"></div>
@@ -192,6 +194,10 @@ header{display:flex;align-items:center;justify-content:space-between;padding:10p
     <div class="toggle"><span>에코 막기<br><small class="note">번역 음성이 나오는 동안 듣기를 멈춤. 기본은 꺼짐(전화처럼 계속 들음). 스피커 소리를 자꾸 다시 번역하면 켜기</small></span><input type="checkbox" id="echoBlock"></div>
 
     <div class="field" style="margin-top:12px">
+      <label>마이크 감도</label>
+      <select id="sens"><option value="high">높음 — 상대가 멀거나 작게 말할 때</option><option value="normal">보통</option><option value="low">낮음 — 시끄러운 곳에서 잡음이 자꾸 잡힐 때</option></select>
+    </div>
+    <div class="field">
       <label>재생 속도 <span id="rateVal"></span></label>
       <input type="range" id="rate" min="0.7" max="1.5" step="0.05">
     </div>

@@ -1,5 +1,5 @@
-/* 마이크 입력 → 발화 구간 감지(VAD) → 16kHz WAV + 피치 기반 성별 추정.
-   순수 함수(detectPitch, estimateGender, createVad, encodeWav, resample)는 node 테스트 대상. */
+/* 마이크 입력(통화 모드) → 발화 구간 감지(VAD) → 16kHz WAV + 피치 기반 성별 추정.
+   순수 함수·클래스(Downsampler, detectPitch, estimateGender, createVad, encodeWav)는 node 테스트 대상. */
 
 export const TARGET_RATE = 16000;
 
@@ -23,6 +23,70 @@ export function resample(input, fromRate, toRate) {
     out[i] = input[i0] * (1 - t) + input[i1] * t;
   }
   return out;
+}
+
+/**
+ * 앨리어싱 없는 실시간 다운샘플러 (48k/44.1k → 16k).
+ * 그냥 건너뛰며 줄이면 8kHz 넘는 소리(식기 소리·쉿 소리)가 말소리 대역으로 접혀 들어와 인식이 나빠짐
+ * (v0.3 까지의 선형 보간 방식이 그랬음). 먼저 저역통과 FIR 로 거르고 출력 위치에서만 계산함.
+ * 조각 단위로 넣어도 이어 붙인 결과가 한 번에 처리한 것과 같도록 앞 조각 꼬리를 기억함.
+ */
+export class Downsampler {
+  /**
+   * @param {number} fromRate
+   * @param {number} [toRate]
+   * @param {number} [taps] 홀수
+   * @param {number} [cutoff] Hz
+   */
+  constructor(fromRate, toRate = TARGET_RATE, taps = 127, cutoff = 6800) {
+    this.ratio = fromRate / toRate;
+    this.taps = taps;
+    const h = new Float32Array(taps);
+    const fc = cutoff / fromRate;
+    const mid = (taps - 1) / 2;
+    let sum = 0;
+    for (let i = 0; i < taps; i++) {
+      const x = i - mid;
+      const sinc = x === 0 ? 2 * fc : Math.sin(2 * Math.PI * fc * x) / (Math.PI * x);
+      // Blackman 창: 저지대역 감쇠 ~-74dB
+      const w = 0.42 - 0.5 * Math.cos((2 * Math.PI * i) / (taps - 1)) + 0.08 * Math.cos((4 * Math.PI * i) / (taps - 1));
+      h[i] = sinc * w;
+      sum += h[i];
+    }
+    for (let i = 0; i < taps; i++) h[i] /= sum;
+    this.h = h;
+    this.hist = new Float32Array(taps);
+    this.pos = 0;
+  }
+
+  /**
+   * @param {Float32Array} input
+   * @returns {Float32Array}
+   */
+  process(input) {
+    if (this.ratio === 1) return Float32Array.from(input);
+    const { taps, h } = this;
+    const buf = new Float32Array(taps + input.length);
+    buf.set(this.hist);
+    buf.set(input, taps);
+    const fir = (n) => {
+      let y = 0;
+      for (let k = 0; k < taps; k++) y += h[k] * buf[n - k];
+      return y;
+    };
+    const out = [];
+    for (;;) {
+      const p = this.pos + taps;
+      const i0 = Math.floor(p);
+      if (i0 + 1 >= buf.length) break;
+      const t = p - i0;
+      out.push(t ? fir(i0) * (1 - t) + fir(i0 + 1) * t : fir(i0));
+      this.pos += this.ratio;
+    }
+    this.pos -= input.length;
+    this.hist = buf.slice(buf.length - taps);
+    return Float32Array.from(out);
+  }
 }
 
 /**
@@ -168,6 +232,8 @@ export function createVad(cfg) {
     reset() { reset(); pre = []; },
     /** 주변 소음 다시 측정 (마이크를 다시 잡은 뒤) */
     recalibrate() { reset(); pre = []; seen = 0; },
+    /** @returns {Float32Array|null} 말하는 중이면 시작부터 지금까지 소리 */
+    current() { return inSpeech && buf.length ? concat(buf) : null; },
     /**
      * @param {Float32Array} frame
      * @returns {{type:'none'|'start'|'end'|'discard', frames?:Float32Array[], db:number}}
@@ -266,41 +332,60 @@ export function concat(frames) {
   return out;
 }
 
+// 오디오 전용 스레드에서 마이크 소리를 2048 샘플씩 모아 넘김. ScriptProcessor 는 화면 그리는 스레드에서 돌아서
+// 화면이 바쁘면 소리 조각을 놓침 → 말 일부가 잘려 인식이 나빠짐
+const WORKLET = `
+class Cap extends AudioWorkletProcessor {
+  constructor() { super(); this.buf = new Float32Array(2048); this.n = 0; }
+  process(inputs) {
+    const ch = inputs[0] && inputs[0][0];
+    if (ch) {
+      for (let i = 0; i < ch.length; i++) {
+        this.buf[this.n++] = ch[i];
+        if (this.n === 2048) { this.port.postMessage(this.buf, [this.buf.buffer]); this.buf = new Float32Array(2048); this.n = 0; }
+      }
+    }
+    return true;
+  }
+}
+registerProcessor('cap', Cap);
+`;
+
+/** 통화 수준 마이크 설정. 지원 안 하는 항목(voiceIsolation 등)은 브라우저가 무시함 */
+export const CALL_AUDIO = {
+  echoCancellation: true,
+  noiseSuppression: true,
+  autoGainControl: true,
+  voiceIsolation: true,
+  channelCount: 1,
+};
+
 /**
- * 브라우저 마이크 캡처. 프레임(16kHz) 단위로 VAD 를 돌리고 발화가 끝나면 onUtterance 호출.
- * 재생할 땐 release() 로 마이크를 완전히 놓음: Android 는 마이크(에코 제거)를 잡고 있는 동안
- * 통화 모드로 바뀌어 TTS 가 작게 나오거나 아예 안 나오는 기기가 있음.
+ * 브라우저 마이크 캡처 (통화 모드). 저역 잡음 제거(85Hz 고역통과) → 오디오 스레드 수집 → 앨리어싱 없는 16kHz 변환
+ * → 프레임 단위 VAD. 발화가 끝나면 onUtterance 호출.
  * @param {{onUtterance?:(u:{pcm:Float32Array, wav:Uint8Array, durationMs:number, gender:object})=>void,
  *          onFrame?:(frame:Float32Array)=>void, onLevel?:(db:number, floor:number, active:boolean)=>void,
- *          onSpeechStart?:()=>void, onDiscard?:()=>void, vad?:object}} handlers
+ *          onSpeechStart?:()=>void, onDiscard?:()=>void, vad?:object, log?:(m:string)=>void}} handlers
  */
 export async function startMic(handlers) {
-  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  const ctx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
   if (ctx.state === 'suspended') await ctx.resume();
-  const proc = ctx.createScriptProcessor(2048, 1, 1);
   const frameMs = (2048 / ctx.sampleRate) * 1000;
   const vad = createVad({ frameMs, ...(handlers.vad || {}) });
+  const down = new Downsampler(ctx.sampleRate);
   let paused = false;
   let stream = null;
   let src = null;
 
-  const acquire = async () => {
-    stream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
-    });
-    src = ctx.createMediaStreamSource(stream);
-    src.connect(proc);
-  };
-  const drop = () => {
-    try { src?.disconnect(); } catch { /* 이미 끊김 */ }
-    stream?.getTracks().forEach((t) => t.stop());
-    stream = null; src = null;
-  };
+  // 에어컨·차 진동 같은 낮은 웅웅거림 제거 (말소리 기본음 최저 ~85Hz 보다 아래)
+  const hp = ctx.createBiquadFilter();
+  hp.type = 'highpass';
+  hp.frequency.value = 85;
+  hp.Q.value = 0.707;
 
-  proc.onaudioprocess = (e) => {
+  const onChunk = (raw) => {
     if (!src) return;
-    const raw = e.inputBuffer.getChannelData(0);
-    const frame = resample(new Float32Array(raw), ctx.sampleRate, TARGET_RATE);
+    const frame = down.process(raw);
     if (paused) { handlers.onLevel?.(rmsDb(frame), vad.noiseFloor, false); return; }
     handlers.onFrame?.(frame);
     const ev = vad.push(frame);
@@ -318,26 +403,58 @@ export async function startMic(handlers) {
       });
     }
   };
-  await acquire();
-  // ScriptProcessor 는 destination 에 연결돼야 콜백이 돎. 무음 gain 으로 하울링 방지
+
+  let capture;
+  let engine = 'worklet';
+  try {
+    const url = URL.createObjectURL(new Blob([WORKLET], { type: 'text/javascript' }));
+    await ctx.audioWorklet.addModule(url);
+    URL.revokeObjectURL(url);
+    capture = new AudioWorkletNode(ctx, 'cap', { numberOfInputs: 1, numberOfOutputs: 1, channelCount: 1, channelCountMode: 'explicit' });
+    capture.port.onmessage = (e) => onChunk(e.data);
+  } catch {
+    // 구형 브라우저: 화면 스레드 방식으로 대체
+    engine = 'script';
+    capture = ctx.createScriptProcessor(2048, 1, 1);
+    capture.onaudioprocess = (e) => onChunk(new Float32Array(e.inputBuffer.getChannelData(0)));
+  }
+  hp.connect(capture);
+  // 처리 노드는 출력까지 이어져야 브라우저가 돌림. 무음 gain 으로 하울링 방지
   const mute = ctx.createGain();
   mute.gain.value = 0;
-  proc.connect(mute).connect(ctx.destination);
+  capture.connect(mute).connect(ctx.destination);
+
+  const acquire = async () => {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: CALL_AUDIO });
+    src = ctx.createMediaStreamSource(stream);
+    src.connect(hp);
+    const st = stream.getAudioTracks()[0]?.getSettings?.() || {};
+    handlers.log?.(`마이크: ${engine === 'worklet' ? '오디오 스레드' : '화면 스레드'} · ${ctx.sampleRate}Hz→16k(앨리어싱 필터) · 에코제거 ${st.echoCancellation ?? '?'} · 잡음제거 ${st.noiseSuppression ?? '?'} · 자동음량 ${st.autoGainControl ?? '?'} · 목소리분리 ${st.voiceIsolation ?? '미지원'}`);
+  };
+  const drop = () => {
+    try { src?.disconnect(); } catch { /* 이미 끊김 */ }
+    stream?.getTracks().forEach((t) => t.stop());
+    stream = null; src = null;
+  };
+  await acquire();
 
   return {
     ctx,
-    /** 재생 중 자기 목소리 재번역 방지: 데이터만 버림 (마이크는 유지) */
+    engine,
+    /** 듣기 일시정지(음소거): 데이터만 버림 (마이크는 유지) */
     pause() { paused = true; vad.reset(); },
     resume() { paused = false; },
     get paused() { return paused; },
-    /** 마이크 장치를 완전히 놓음 (Android 통화 모드 해제 → 스피커 정상 출력) */
+    /** 지금 말하는 중인 소리(시작 이후) — 실시간 모드 화자 판정용 */
+    currentSpeech() { return vad.current(); },
+    /** 마이크 장치를 완전히 놓음 */
     release() { paused = true; vad.reset(); drop(); },
     /** release 후 다시 잡음 */
     async reacquire() { if (!stream) await acquire(); vad.recalibrate(); paused = false; },
     get released() { return !stream; },
     stop() {
       drop();
-      proc.disconnect();
+      try { capture.disconnect(); } catch { /* 끊김 */ }
       ctx.close();
     },
   };
