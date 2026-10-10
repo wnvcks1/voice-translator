@@ -3,19 +3,19 @@
    실시간 모드(베타): 마이크 소리를 Gemini Live Translate 세션 2개에 계속 흘려보내고 번역 음성을 바로 재생 */
 
 import { startMic, estimateGender } from './audio.js';
-import { interpret, listModels, pickModels, LANGS, AI_VOICES } from './gemini.js';
+import { interpret, listModels, pickModels, verifyTranslation, LANGS, AI_VOICES } from './gemini.js';
 import { Speaker, loadVoices } from './tts.js';
 import { LiveSession, PcmPlayer, scriptLang, SCRIPT_OF, EchoGuard } from './live.js';
 import { voiceFeatures, VoiceProfiles } from './voice.js';
 
-const VERSION = 'v0.5';
+const VERSION = 'v0.6';
 const $ = (id) => document.getElementById(id);
 const SKEY = 'dt-settings';
 
 const DEFAULTS = {
   key: '', chatModel: '', chatList: [], ttsModel: '', liveModel: '', models: [], bidiModels: [],
   them: 'zh', aiVoice: false, aiVoiceMale: 'Charon', aiVoiceFemale: 'Kore',
-  echoBlock: false, rate: 1, silenceMs: 700, maleMax: 160, femaleMin: 180, sens: 'normal',
+  echoBlock: false, rate: 1, silenceMs: 700, maleMax: 160, femaleMin: 180, sens: 'normal', volume: 0.6, verify: true,
   liveMode: true, meGender: 'auto', themGender: 'auto', sideGender: {}, ver: 3,
 };
 
@@ -410,9 +410,47 @@ async function startSentenceMode() {
  */
 const liveVoice = (g) => (g === 'male' ? S.aiVoiceMale : g === 'female' ? S.aiVoiceFemale : null);
 
+/**
+ * 실시간 번역 검수: 끝난 말을 글 번역 모델(Flash-Lite)로 한 번 더 확인해 뜻이 틀렸으면 카드 고치고 정정본을 읽음.
+ * 실시간 모델은 속도 우선이라 짧은 말 뜻을 놓칠 때가 있음 (실측: '밥도 먹어' → '좋아').
+ * @param {{lang:string, src:string, dst:string, toLang:string, gender:string}} turn
+ * @param {{el:HTMLElement, dst:HTMLElement, meta:HTMLElement}} card
+ */
+async function verifyLive(turn, card) {
+  const model = modelQueue()[0];
+  if (!model) return;
+  const t0 = performance.now();
+  try {
+    const v = await verifyTranslation({ key: S.key, model, from: turn.lang, to: turn.toLang, src: turn.src, live: turn.dst, history: history.slice(-4) });
+    const ms = Math.round(performance.now() - t0);
+    if (!v) { log(`검수 응답 해석 실패 (${ms}ms)`); return; }
+    if (v.ok) { log(`검수 OK (${ms}ms) "${turn.dst.slice(0, 20)}"`); return; }
+    log(`검수 정정 (${ms}ms) "${turn.dst}" → "${v.text}"`);
+    const old = document.createElement('div');
+    old.className = 'was';
+    old.textContent = turn.dst;
+    card.dst.textContent = v.text;
+    card.dst.after(old);
+    const tag = document.createElement('span');
+    tag.className = 'fix';
+    tag.textContent = '✎ 정정';
+    card.meta.prepend(tag, ' ');
+    turn.dst = v.text;
+    const h = history.find((x) => x.src === turn.src);
+    if (h) h.dst = v.text;
+    echo.add(v.text, turn.toLang);
+    // 정정은 확실히 들리게 AI 음성 우선 (폰 음성은 소리 없이 '성공'하는 기기가 있었음)
+    speaker.say(v.text, LANGS[turn.toLang].bcp, turn.gender, { preferAi: true })
+      .then((r) => log(`정정 읽기 ${r.engine} ${r.status} [${r.voice}]`));
+  } catch (e) {
+    if (e.status === 429) exhausted.set(model, Date.now() + 60e3);
+    log(`검수 실패 ${e.message}`);
+  }
+}
+
 async function startLive() {
   if (!S.liveModel) throw new Error('실시간 번역 모델 없음 — 설정에서 연결 확인을 다시 누르세요');
-  const player = new PcmPlayer(() => speaker.audioCtx());
+  const player = new PcmPlayer(() => speaker.audioCtx(), () => speaker.out());
   const them = S.them;
   S.sideGender = S.sideGender || {};
   // 세션별 상태: →상대언어 세션은 한국어 말을 받아 왼쪽 카드, →한국어 세션은 상대 말을 받아 오른쪽 카드
@@ -487,6 +525,9 @@ async function startLive() {
       big.onclick = () => openShow(turn);
       x.card.meta.append(' ', big);
       log(`실시간 ${x.from}→${x.to} | ${lat} | 목소리 ${genderName(x.voiceG)} | "${turn.src.slice(0, 30)}" → "${turn.dst.slice(0, 30)}"${learned ? ' | 목소리 학습' : ''}`);
+      if (turn.src && turn.dst && S.verify) verifyLive(turn, x.card);
+      history.push({ lang: turn.lang, src: turn.src, dst: turn.dst });
+      if (history.length > 20) history.shift();
     } else if (x.card) x.card.el.remove();
     clearTimeout(x.holdTimer);
     Object.assign(x, { ...blank, held: [], audio: [] });
@@ -684,7 +725,7 @@ async function testSound() {
   const g = ctx.createGain();
   g.gain.value = 0.25;
   osc.frequency.value = 660;
-  osc.connect(g).connect(ctx.destination);
+  osc.connect(g).connect(speaker.out());
   osc.start();
   osc.stop(ctx.currentTime + 0.6);
   await new Promise((r) => setTimeout(r, 900));
@@ -812,6 +853,10 @@ function bindSettings() {
   $('themGender').onchange = (e) => { S.themGender = e.target.value; save(); };
   $('btnSound').onclick = testSound;
   $('echoBlock').checked = S.echoBlock;
+  $('volume').value = S.volume;
+  $('volume').oninput = (e) => { S.volume = Number(e.target.value); speaker.setVolume(); save(); };
+  $('verify').checked = S.verify;
+  $('verify').onchange = (e) => { S.verify = e.target.checked; save(); };
   $('sens').value = S.sens;
   $('sens').onchange = (e) => { S.sens = e.target.value; save(); if (listening) log('감도는 통화를 다시 시작하면 적용'); };
   $('rate').value = S.rate; $('rateVal').textContent = `${S.rate}x`;

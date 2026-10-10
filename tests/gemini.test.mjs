@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseLines, pickModels, buildPrompt, sseText, toBase64, interpret, thinkingVariants } from '../gemini.js';
+import { parseLines, pickModels, buildPrompt, sseText, toBase64, interpret, thinkingVariants, parseVerify, buildVerifyPrompt, verifyTranslation } from '../gemini.js';
 
 test('parseLines: 완성된 4줄', () => {
   const p = parseLines('L|zh\nG|female\nS|你好，请问洗手间在哪里？\nT|안녕하세요, 화장실이 어디예요?\n');
@@ -123,4 +123,32 @@ test('buildPrompt: 목소리 힌트 없음, 언어는 실제 말한 내용으로
   assert.doesNotMatch(t, /Voice analysis/);
   assert.match(t, /ONLY from what is actually said/);
   assert.match(t, /same person may speak either language/);
+});
+
+test('parseVerify: OK/FIX 한 줄, 구분자 변형 허용, 엉뚱한 답은 null', () => {
+  assert.deepEqual(parseVerify('OK|也吃饭吧'), { ok: true, text: '也吃饭吧' });
+  assert.deepEqual(parseVerify('FIX｜你也吃饭吧。\n'), { ok: false, text: '你也吃饭吧。' });
+  assert.deepEqual(parseVerify('```\nfix: 你也吃饭吧'), { ok: false, text: '你也吃饭吧' });
+  assert.equal(parseVerify('잘 모르겠음'), null);
+});
+
+test('buildVerifyPrompt: 원문·실시간 번역·맥락 포함', () => {
+  const t = buildVerifyPrompt('ko', 'zh', '밥도 먹어', '好的', [{ lang: 'zh', src: '我吃过了', dst: '저는 먹었어요' }]);
+  assert.match(t, /Korean utterance: 밥도 먹어/);
+  assert.match(t, /Live Mandarin Chinese.*translation: 好的/);
+  assert.match(t, /我吃过了 => 저는 먹었어요/);
+  assert.match(t, /FIX\|/);
+});
+
+test('verifyTranslation: 글만 보내고 FIX 답을 돌려줌 (실측 사례: 밥도 먹어 → 좋아)', async () => {
+  let body = null;
+  globalThis.fetch = async (url, init) => {
+    body = JSON.parse(init.body);
+    assert.match(url, /:generateContent$/);
+    return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: 'FIX|你也吃饭吧。' }] } }] }), { status: 200 });
+  };
+  const v = await verifyTranslation({ key: 'k', model: 'gemini-2.5-flash-lite', from: 'ko', to: 'zh', src: '밥도 먹어', live: '好的' });
+  assert.deepEqual(v, { ok: false, text: '你也吃饭吧。' });
+  assert.equal(body.contents[0].parts.length, 1, '소리 없이 글만');
+  assert.match(body.contents[0].parts[0].text, /밥도 먹어/);
 });

@@ -46,6 +46,12 @@ async function newPage(o = {}) {
     window.__stops = 0;
     window.__played = 0;
     window.__playedVals = [];
+    window.__gains = [];
+    const origConnect = AudioNode.prototype.connect;
+    AudioNode.prototype.connect = function (dest, ...a) {
+      if (this instanceof AudioBufferSourceNode && dest instanceof GainNode) window.__gains.push(Math.round(dest.gain.value * 100) / 100);
+      return origConnect.call(this, dest, ...a);
+    };
     const origStart = AudioBufferSourceNode.prototype.start;
     AudioBufferSourceNode.prototype.start = function (...a) {
       if (this.buffer?.duration > 0.05) { window.__played++; window.__playedVals.push(Math.round(this.buffer.getChannelData(0)[0] * 10) / 10); }
@@ -92,7 +98,7 @@ async function newPage(o = {}) {
     speechSynthesis.getVoices = () => fakeVoices;
     speechSynthesis.speak = (u) => {
       if (!u.text.trim()) return;
-      window.__spoken.push({ text: u.text, lang: u.lang, pitch: u.pitch, gum: window.__gum, stops: window.__stops });
+      window.__spoken.push({ text: u.text, lang: u.lang, pitch: u.pitch, volume: u.volume, gum: window.__gum, stops: window.__stops });
       if (opt.zhTtsFails && u.lang === 'zh-CN') { setTimeout(() => u.onerror?.({ error: 'language-unavailable' }), 50); return; }
       setTimeout(() => u.onstart?.(), 20);
       setTimeout(() => u.onend?.(), 300);
@@ -179,6 +185,7 @@ const MODELS = {
   check('[문장] 소리 테스트 3단계 기록', /1\/3 삐: AudioContext running/.test(log) && /2\/3 폰 음성: ok/.test(log) && /3\/3 AI 음성: ok/.test(log), log.split('\n').filter((l) => /소리 테스트/.test(l)).join(' / '));
   check('[문장] 폰 중국어 음성 실패 → AI 음성 대체 재생', calls.some((c) => c.tts) && st.played >= 1 && /AI 음성으로 대체/.test(log), `tts요청 ${calls.filter((c) => c.tts).length} 재생 ${st.played}`);
   check('[문장] 한국어 번역은 폰 음성·여자 음높이', spoken.some((s) => s.lang === 'ko-KR' && s.pitch >= 1), JSON.stringify(spoken));
+  check('[음량] 기본 음량 0.6 이 폰 음성에도 적용', spoken.length > 0 && spoken.every((s) => Math.abs(s.volume - 0.6) < 1e-6), JSON.stringify(spoken.map((s) => s.volume)));
   check('[문장] 두 번째 요청에 대화 맥락 포함', /이거 얼마예요\? => 这个多少钱？/.test(chatCalls[2]?.body.contents[0].parts[1].text || ''));
   check('[문장] 마이크 켠 채 계속 처리 (3번째 발화도 전송)', chatCalls.length === 4, `${chatCalls.length}건`);
   check('[분류] 문장 모드 요청에 목소리 힌트 없음 (중국어를 한국어로 듣는 편향 방지)', chatCalls.every((c) => !/Voice analysis/.test(c.body.contents[0].parts[1].text)), '');
@@ -204,6 +211,26 @@ const MODELS = {
   check('[이전 설정] v0.1 의 Flash 설정이 Flash-Lite 우선으로 바뀜', saved.chatModel === 'gemini-2.5-flash-lite' && saved.chatList[0] === 'gemini-2.5-flash-lite', JSON.stringify(saved));
   await ctx.close();
 }
+
+/**
+ * REST API 흉내 (실시간 모드용): 모델 목록, 번역 검수(중국어 '这个三十块。' 은 정정), TTS.
+ * @param {object[]} calls 요청 기록
+ */
+const restMock = (calls) => async (route) => {
+  const u = route.request().url();
+  if (/\/models\?/.test(u)) return route.fulfill({ json: MODELS });
+  const body = JSON.parse(route.request().postData() || '{}');
+  if (body.generationConfig?.responseModalities?.includes('AUDIO')) {
+    calls.push({ kind: 'tts', text: body.contents[0].parts[0].text, voice: body.generationConfig.speechConfig.voiceConfig.prebuiltVoiceConfig.voiceName });
+    return route.fulfill({ json: { candidates: [{ content: { parts: [{ inlineData: { mimeType: 'audio/L16;codec=pcm;rate=24000', data: Buffer.alloc(24000 * 0.3 * 2).toString('base64') } }] } }] } });
+  }
+  const prompt = body.contents[0].parts.at(-1).text;
+  calls.push({ kind: 'verify', prompt });
+  // 맥락(이전 대화)이 아니라 이번 원문 줄만 보고 판단
+  const utter = (prompt.match(/utterance: (.*)/) || ['', ''])[1];
+  const text = /这个三十块/.test(utter) ? 'FIX|이거 30위안이에요.' : `OK|${(prompt.match(/translation: (.*)/) || ['', ''])[1]}`;
+  return route.fulfill({ json: { candidates: [{ content: { parts: [{ text }] } }] } });
+};
 
 /* ================= 2. 실시간 모드 ================= */
 /**
@@ -285,7 +312,8 @@ function liveMock(o = {}) {
 
 {
   const { page, errors, ctx } = await newPage();
-  await page.route('https://generativelanguage.googleapis.com/**', (route) => route.fulfill({ json: MODELS }));
+  const calls = [];
+  await page.route('https://generativelanguage.googleapis.com/**', restMock(calls));
   const mock = liveMock();
   const { setups, counts } = mock;
   await page.routeWebSocket(/BidiGenerateContent/, mock.handler);
@@ -297,6 +325,8 @@ function liveMock(o = {}) {
   await page.waitForSelector('#keyStatus .ok', { timeout: 5000 });
   await page.check('#liveMode');
   await page.click('#btnCloseSheet');
+  await page.fill('#volume', '0.3');
+  await page.dispatchEvent('#volume', 'input');
   await page.click('#btnMic');
   await page.waitForFunction(() => document.querySelectorAll('.turn:not(.pending)').length >= 2, null, { timeout: 25000 }).catch(() => {});
   await page.waitForTimeout(500);
@@ -313,7 +343,8 @@ function liveMock(o = {}) {
   await page.waitForTimeout(1500);
   await page.screenshot({ path: join(out, 'l2-live-ok.png') });
   const turns = await page.$$eval('.turn', (els) => els.map((e) => ({ cls: e.className, src: e.querySelector('.src').textContent, dst: e.querySelector('.dst').textContent, meta: e.querySelector('.meta').textContent })));
-  const st = await page.evaluate(() => ({ played: window.__played, vals: window.__playedVals }));
+  const st = await page.evaluate(() => ({ played: window.__played, vals: window.__playedVals.filter((v) => v !== 0), all: window.__playedVals, gains: window.__gains }));
+  const was = await page.$$eval('.turn .was', (els) => els.map((e) => e.textContent));
   const saved = await page.evaluate(() => JSON.parse(localStorage.getItem('dt-settings')).sideGender);
   const log = await page.textContent('#log');
 
@@ -332,8 +363,14 @@ function liveMock(o = {}) {
   check('[실시간] 확실한 말로 양쪽 목소리 학습', (log.match(/목소리 학습/g) || []).length === 2, (log.match(/실시간 .*/g) || []).join(' / '));
   check('[실시간] 카드마다 🔊 다시 (보류됐던 소리도 저장)', (await page.$$eval('.turn', (els) => els.filter((e) => /다시/.test(e.querySelector('.meta').textContent)).length)) === 3);
   check('[실시간] 한국어 → 왼쪽 카드 (다시 번역해도 글자 안 겹침)', turns[0]?.cls.includes('left') && turns[0].src === '이거 얼마예요?' && turns[0].dst === '这个多少钱？', JSON.stringify(turns));
-  check('[실시간] 중국어 → 오른쪽 카드', turns[1]?.cls.includes('right') && turns[1].src === '这个三十块。' && turns[1].dst === '이건 30위안이에요.', JSON.stringify(turns[1]));
-  check('[실시간] 번역 음성 3번만 재생 (같은 언어 되풀이·스피커 에코·상대 쪽 OK·옛 목소리는 막음)', st.played === 3, `재생 ${st.played}회`);
+  check('[실시간] 중국어 → 오른쪽 카드', turns[1]?.cls.includes('right') && turns[1].src === '这个三十块。', JSON.stringify(turns[1]));
+  check('[실시간] 번역 음성 3번 + 정정 1번만 재생 (같은 언어 되풀이·스피커 에코·상대 쪽 OK·옛 목소리는 막음)', st.played === 4 && st.all.filter((v) => v === 0).length === 1, `재생 ${st.played}회 ${JSON.stringify(st.all)}`);
+  check('[음량] 화면 음량 0.3 이 모든 번역 소리에 적용', st.gains.length >= 4 && st.gains.every((g) => g === 0.3), JSON.stringify(st.gains));
+  const verifies = calls.filter((c) => c.kind === 'verify');
+  const tts = calls.filter((c) => c.kind === 'tts');
+  check('[검수] 실시간 턴마다 글 번역으로 확인 (소리 없이 글만)', verifies.length === 3 && /Korean utterance: 이거 얼마예요\?/.test(verifies[0].prompt), verifies.map((v) => v.prompt.split('\n').find((l) => /utterance/.test(l))).join(' / '));
+  check('[검수] 뜻이 틀린 번역은 카드 고치고 옛 번역은 줄 그어 표시', turns[1]?.dst === '이거 30위안이에요.' && was.includes('이건 30위안이에요.') && /✎ 정정/.test(turns[1]?.meta || ''), `${JSON.stringify(turns[1])} was=${JSON.stringify(was)}`);
+  check('[검수] 정정본은 AI 음성으로 그 쪽 성별(여) 맞춰 읽음', tts.length === 1 && tts[0].text === '이거 30위안이에요.' && tts[0].voice === 'Kore', JSON.stringify(tts));
   check('[실시간] 에코 무시 기록', /실시간 에코 무시/.test(log), '');
   check('[실시간] 페이지 오류 없음', errors.length === 0, errors.join(' | '));
   process.stdout.write(`\n--- 실시간 모드 로그 ---\n${log}\n`);
@@ -351,7 +388,7 @@ function liveMock(o = {}) {
 /* ================= 2-b. 모델이 목소리 지정을 거부하면 앱 음성으로 ================= */
 {
   const { page, errors, ctx } = await newPage();
-  await page.route('https://generativelanguage.googleapis.com/**', (route) => route.fulfill({ json: MODELS }));
+  await page.route('https://generativelanguage.googleapis.com/**', restMock([]));
   const mock = liveMock({ rejectVoice: true });
   await page.routeWebSocket(/BidiGenerateContent/, mock.handler);
   await page.goto(url);
@@ -370,7 +407,7 @@ function liveMock(o = {}) {
   const ko = spoken.find((x) => x.lang === 'ko-KR');
   check('[목소리 미지원] 모델이 목소리 지정을 거부하면 번역 글을 앱 음성으로 성별 맞춰 읽음', /목소리 지정을 안 받음/.test(log) && zh?.text === '这个多少钱？' && zh.pitch < 1 && ko?.text === '이건 30위안이에요.' && ko.pitch > 1,
     `${JSON.stringify(spoken)} | ${(log.match(/목소리 지정.*/) || [''])[0]}`);
-  check('[목소리 미지원] 모델 기본 목소리 소리는 안 나감', vals.length === 0, JSON.stringify(vals));
+  check('[목소리 미지원] 모델 기본 목소리 소리는 안 나감 (0.3 표시 소리 없음, 0 은 정정 AI 음성)', !vals.includes(0.3), JSON.stringify(vals));
   check('[목소리 미지원] 페이지 오류 없음', errors.length === 0, errors.join(' | '));
   await ctx.close();
 }

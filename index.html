@@ -52,6 +52,11 @@ header{display:flex;align-items:center;justify-content:space-between;padding:10p
 .turn.err .dst{color:var(--bad);font-size:13px}
 
 .status{text-align:center;padding:6px 16px 0;min-height:52px}
+/* 앱 안 음량: 통화 모드에선 폰 측면 버튼이 번역 소리를 못 줄이는 기기가 있음 */
+.vol{display:flex;align-items:center;gap:10px;padding:4px 28px 0;font-size:16px}
+.vol input{flex:1;accent-color:var(--accent);height:28px}
+.turn .was{font-size:13px;color:var(--sub);text-decoration:line-through;margin-top:2px}
+.turn .meta .fix{color:var(--warn);font-weight:600}
 .bars{display:flex;justify-content:center;gap:8px;height:24px;align-items:center}
 .bars i{width:12px;height:12px;border-radius:50%;background:#fff;opacity:.35;transition:transform .08s,opacity .08s}
 .status p{font-size:15px;margin-top:6px;color:var(--text)}
@@ -123,6 +128,11 @@ header{display:flex;align-items:center;justify-content:space-between;padding:10p
   </div>
 </main>
 
+<div class="vol">
+  <span aria-hidden="true">🔈</span>
+  <input type="range" id="volume" min="0" max="1" step="0.05" aria-label="번역 소리 크기">
+  <span aria-hidden="true">🔊</span>
+</div>
 <div class="status">
   <div class="bars" id="bars"><i></i><i></i><i></i></div>
   <p id="statusText">가운데 버튼을 누르면 통화(통역) 시작</p>
@@ -136,7 +146,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:10p
   </button>
   <button class="ctrl" id="btnShow" aria-label="상대에게 크게 보여주기" disabled>🔍</button>
 </div>
-<div class="foot">내용은 AI 가 생성함 · Gemini · v0.5</div>
+<div class="foot">내용은 AI 가 생성함 · Gemini · v0.6</div>
 
 <div id="show">
   <div class="big" id="showBig"></div>
@@ -191,6 +201,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:10p
       <select id="ttsModel"></select>
     </div>
 
+    <div class="toggle"><span>번역 검수 (실시간)<br><small class="note">말이 끝나면 글 번역으로 한 번 더 확인해 뜻이 틀렸으면 고치고 '정정'을 읽음. 요청 1건씩 더 씀</small></span><input type="checkbox" id="verify"></div>
     <div class="toggle"><span>에코 막기<br><small class="note">번역 음성이 나오는 동안 듣기를 멈춤. 기본은 꺼짐(전화처럼 계속 들음). 스피커 소리를 자꾸 다시 번역하면 켜기</small></span><input type="checkbox" id="echoBlock"></div>
 
     <div class="field" style="margin-top:12px">

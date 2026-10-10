@@ -258,9 +258,13 @@ export class LiveSession {
  * 받은 번역 음성 조각을 끊김 없이 이어서 재생함.
  */
 export class PcmPlayer {
-  /** @param {()=>AudioContext} getCtx */
-  constructor(getCtx) {
+  /**
+   * @param {()=>AudioContext} getCtx
+   * @param {()=>AudioNode} [getOut] 음량 조절 노드 (없으면 바로 스피커)
+   */
+  constructor(getCtx, getOut) {
     this.getCtx = getCtx;
+    this.getOut = getOut || (() => getCtx().destination);
     this.next = 0;
     this.nodes = new Set();
   }
@@ -282,7 +286,7 @@ export class PcmPlayer {
     buf.getChannelData(0).set(f);
     const node = ctx.createBufferSource();
     node.buffer = buf;
-    node.connect(ctx.destination);
+    node.connect(this.getOut());
     const at = Math.max(ctx.currentTime + 0.03, this.next);
     node.start(at);
     this.next = at + buf.duration;

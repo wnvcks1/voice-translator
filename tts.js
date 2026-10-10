@@ -72,9 +72,38 @@ export class Speaker {
 
   /** 재생용 AudioContext. 반드시 사용자 터치 안에서 처음 만들어야 Android 가 소리를 막지 않음 */
   audioCtx() {
-    if (!this.ctx || this.ctx.state === 'closed') this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    if (!this.ctx || this.ctx.state === 'closed') {
+      this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+      this.master = null;
+    }
     if (this.ctx.state === 'suspended') this.ctx.resume().catch(() => {});
     return this.ctx;
+  }
+
+  /**
+   * 모든 번역 소리가 지나가는 음량 조절 노드. 통화 모드에선 폰 측면 버튼이 이 소리를 못 줄이는 기기가 있어
+   * 앱 화면에서 직접 조절함.
+   * @returns {GainNode}
+   */
+  out() {
+    const ctx = this.audioCtx();
+    if (!this.master) {
+      this.master = ctx.createGain();
+      this.master.connect(ctx.destination);
+    }
+    this.master.gain.value = this.volume();
+    return this.master;
+  }
+
+  /** @returns {number} 0~1 */
+  volume() {
+    const v = Number(this.o.getSettings().volume);
+    return Number.isFinite(v) ? Math.max(0, Math.min(1, v)) : 0.6;
+  }
+
+  /** 음량 바로 반영 */
+  setVolume() {
+    if (this.master) this.master.gain.value = this.volume();
   }
 
   /** 첫 재생은 사용자 터치 안에서 해야 Android 가 막지 않음 */
@@ -97,15 +126,16 @@ export class Speaker {
    * @param {string} text
    * @param {string} bcp
    * @param {'male'|'female'|'unknown'} gender
+   * @param {{preferAi?:boolean}} [opt] preferAi: 키가 있으면 AI 음성 먼저
    * @returns {Promise<{engine:string, voice:string, status:string}>}
    */
-  say(text, bcp, gender) {
+  say(text, bcp, gender, opt = {}) {
     const run = async () => {
       const s = this.o.getSettings();
       await this.o.onBusy(true);
       try {
         const canAi = s.key && s.ttsModel;
-        if (s.aiVoice && canAi) {
+        if ((s.aiVoice || opt.preferAi) && canAi) {
           try {
             return await this.sayAi(text, gender, s);
           } catch (e) {
@@ -148,6 +178,7 @@ export class Speaker {
       try { if (voice) u.voice = voice; } catch { /* 일부 브라우저: 음성 객체 불일치 → lang 으로 대체 */ }
       u.pitch = pitch;
       u.rate = s.rate || 1;
+      u.volume = this.volume();
       // Chrome: 발화 객체가 GC 되면 onend 가 안 옴 → 참조 유지
       this.utt = u;
       const name = `${voice?.name || `(${bcp} 기본)`} p${pitch}`;
@@ -176,7 +207,7 @@ export class Speaker {
       const node = ctx.createBufferSource();
       node.buffer = buf;
       node.playbackRate.value = s.rate || 1;
-      node.connect(ctx.destination);
+      node.connect(this.out());
       node.onended = resolve;
       this.current = node;
       node.start();

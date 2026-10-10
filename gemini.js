@@ -225,6 +225,69 @@ export function sseText(ev) {
   return s;
 }
 
+/**
+ * 실시간 통역 결과 검수 지시문. 실시간 모델은 속도 우선이라 짧은 말 뜻을 놓칠 때가 있음 (실측: '밥도 먹어' → '좋아').
+ * @param {string} from 원문 언어 코드
+ * @param {string} to 번역 언어 코드
+ * @param {string} src 받아적은 원문
+ * @param {string} live 실시간 번역
+ * @param {{lang:string, src:string, dst:string}[]} history
+ * @returns {string}
+ */
+export function buildVerifyPrompt(from, to, src, live, history = []) {
+  const ctx = history.length ? `Recent conversation (context only):\n${history.map((h) => `- [${h.lang}] ${h.src} => ${h.dst}`).join('\n')}\n\n` : '';
+  return `${ctx}You check a live interpreter in a face-to-face conversation.
+${LANGS[from].en} utterance: ${src}
+Live ${LANGS[to].en} translation: ${live}
+
+If the live translation conveys the same meaning (wording may differ), answer: OK|<the live translation>
+If the meaning is wrong, missing, or added, answer: FIX|<a natural spoken ${LANGS[to].en} translation>
+One line only, no quotes, no notes.`;
+}
+
+/**
+ * 검수 답 해석.
+ * @param {string} text
+ * @returns {{ok:boolean, text:string}|null}
+ */
+export function parseVerify(text) {
+  const m = text.trim().replace(/^[`*\s]+/, '').match(/^(OK|FIX)\s*[|｜:]\s*(.+)$/im);
+  if (!m) return null;
+  return { ok: m[1].toUpperCase() === 'OK', text: m[2].trim() };
+}
+
+/**
+ * 실시간 번역 검수 (글만 보내므로 빠르고 가벼움).
+ * @param {{key:string, model:string, from:string, to:string, src:string, live:string, history?:object[], signal?:AbortSignal}} o
+ * @returns {Promise<{ok:boolean, text:string}|null>}
+ */
+export async function verifyTranslation(o) {
+  const variants = thinkingMemo.has(o.model) ? [thinkingMemo.get(o.model)] : thinkingVariants(o.model);
+  for (let i = 0; i < variants.length; i++) {
+    const generationConfig = { temperature: 0.1, maxOutputTokens: 200 };
+    if (variants[i]) generationConfig.thinkingConfig = variants[i];
+    const res = await fetch(`${BASE}/models/${o.model}:generateContent`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': o.key },
+      body: JSON.stringify({
+        contents: [{ role: 'user', parts: [{ text: buildVerifyPrompt(o.from, o.to, o.src, o.live, o.history) }] }],
+        generationConfig,
+      }),
+      signal: o.signal,
+    });
+    if (res.ok) {
+      thinkingMemo.set(o.model, variants[i]);
+      const j = await res.json();
+      const t = (j.candidates?.[0]?.content?.parts || []).filter((p) => p.text && !p.thought).map((p) => p.text).join('');
+      return parseVerify(t);
+    }
+    const err = await apiError(res);
+    if (err.status === 400 && /think/i.test(err.message) && i < variants.length - 1) continue;
+    throw err;
+  }
+  return null;
+}
+
 export const AI_VOICES = {
   female: ['Kore', 'Aoede', 'Leda', 'Zephyr'],
   male: ['Charon', 'Puck', 'Orus', 'Fenrir'],
