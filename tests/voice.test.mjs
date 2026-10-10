@@ -65,18 +65,24 @@ test('VoiceProfiles: 남(나) vs 여(상대) — 두 번씩 배우면 새 발화
   assert.ok(Math.abs(p.pitch('left') - 115) < 12 && Math.abs(p.pitch('right') - 215) < 20);
 });
 
-test('VoiceProfiles: 음높이 비슷한 남자 둘도 음색으로 구분 (짧은 0.6초 "네"·"OK" 수준)', () => {
+test('VoiceProfiles: 혼자 두 언어로 말하면(같은 목소리) 판정 안 함 — 언어를 사람으로 오인 금지', () => {
+  const p = new VoiceProfiles();
+  for (let s = 0; s < 3; s++) {
+    p.learn('left', voiceFeatures(MAN_A(1.2, 100 + s), SR));
+    p.learn('right', voiceFeatures(MAN_A(1.2, 200 + s), SR));
+  }
+  assert.equal(p.separable(), false);
+  assert.equal(p.classify(voiceFeatures(MAN_A(0.6, 300), SR)).side, null);
+});
+
+test('VoiceProfiles: 음높이 비슷한 남자 둘도 판정 안 함 (오판보다 보류)', () => {
   const p = new VoiceProfiles();
   for (let s = 0; s < 3; s++) {
     p.learn('left', voiceFeatures(MAN_A(1.2, 100 + s), SR));
     p.learn('right', voiceFeatures(MAN_B(1.2, 200 + s), SR));
   }
-  let ok = 0;
-  for (let s = 0; s < 10; s++) {
-    if (p.classify(voiceFeatures(MAN_A(0.6, 300 + s), SR)).side === 'left') ok++;
-    if (p.classify(voiceFeatures(MAN_B(0.6, 400 + s), SR)).side === 'right') ok++;
-  }
-  assert.ok(ok >= 18, `20개 중 ${ok}개 맞힘`);
+  assert.equal(p.separable(), false);
+  assert.equal(p.classify(voiceFeatures(MAN_B(0.6, 400), SR)).conf, 0);
 });
 
 test('VoiceProfiles: 쪽마다 최근 12개만 기억', () => {
@@ -88,22 +94,19 @@ test('VoiceProfiles: 쪽마다 최근 12개만 기억', () => {
   assert.equal(p.sides.right.length, 0);
 });
 
-test('VoiceProfiles: 시끄러운 식당(잡음 크고 상대가 멀어 작게 들림)에서도 같은 자리에서 배우면 구분', () => {
-  for (const [noise, gain] of [[0.02, 1], [0.03, 0.5]]) {
+test('VoiceProfiles: 시끄러운 식당(잡음 크고 상대가 멀어 작게 들림)에서도 남녀는 구분', () => {
+  for (const noise of [0.02, 0.03]) {
     const p = new VoiceProfiles();
     for (let s = 0; s < 3; s++) {
-      p.learn('left', voiceFeatures(MAN_A(1.2, 100 + s, noise, gain), SR));
-      p.learn('right', voiceFeatures(MAN_B(1.2, 200 + s, noise, gain), SR));
+      p.learn('left', voiceFeatures(MAN_A(1.2, 100 + s, noise, 0.6), SR));
+      p.learn('right', voiceFeatures(WOMAN(1.2, 200 + s), SR));
     }
-    let ok = 0, minConf = 1;
+    let ok = 0;
     for (let s = 0; s < 10; s++) {
-      const a = p.classify(voiceFeatures(MAN_A(0.6, 300 + s, noise, gain), SR));
-      const b = p.classify(voiceFeatures(MAN_B(0.6, 400 + s, noise, gain), SR));
-      ok += (a.side === 'left') + (b.side === 'right');
-      minConf = Math.min(minConf, a.conf, b.conf);
+      ok += p.classify(voiceFeatures(MAN_A(0.6, 300 + s, noise, 0.6), SR)).side === 'left';
+      ok += p.classify(voiceFeatures(WOMAN(0.6, 400 + s), SR)).side === 'right';
     }
     assert.ok(ok >= 19, `noise ${noise}: ${ok}/20`);
-    assert.ok(minConf > 0.3, `noise ${noise}: 최소 확신도 ${minConf.toFixed(2)}`);
   }
 });
 

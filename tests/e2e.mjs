@@ -176,6 +176,7 @@ const MODELS = {
   check('[문장] 한국어 번역은 폰 음성·여자 음높이', spoken.some((s) => s.lang === 'ko-KR' && s.pitch >= 1), JSON.stringify(spoken));
   check('[문장] 두 번째 요청에 대화 맥락 포함', /이거 얼마예요\? => 这个多少钱？/.test(chatCalls[2]?.body.contents[0].parts[1].text || ''));
   check('[문장] 마이크 켠 채 계속 처리 (3번째 발화도 전송)', chatCalls.length === 4, `${chatCalls.length}건`);
+  check('[분류] 문장 모드 요청에 목소리 힌트 없음 (중국어를 한국어로 듣는 편향 방지)', chatCalls.every((c) => !/Voice analysis/.test(c.body.contents[0].parts[1].text)), '');
   check('[문장] 카드에 분류 근거(글자) 표시', /분류 글자/.test(turns[0]?.meta || '') && /분류 글자/.test(turns[1]?.meta || ''), turns.map((t) => t.meta).join(' / '));
   check('[통화] 통화 시간 표시', /통화 중 00:\d\d/.test(await page.textContent('#pillText')), await page.textContent('#pillText'));
   check('[통화] 마이크 정보 기록 (오디오 스레드·앨리어싱 필터)', /마이크: 오디오 스레드 · \d+Hz→16k\(앨리어싱 필터\)/.test(log), (log.match(/마이크: .*/) || [''])[0]);

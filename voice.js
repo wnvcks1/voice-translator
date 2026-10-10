@@ -1,5 +1,7 @@
 /* 화자 구분: 목소리 특징(음높이 + 음색 MFCC 평균)을 대화 중에 배워서 '나(왼쪽)'와 '상대(오른쪽)'를 가름.
-   언어(글자 종류)로 확실히 갈리는 말에서 배우고, '네'·'OK'·숫자처럼 언어로 애매한 짧은 말에 씀. */
+   언어(글자 종류)로 확실히 갈리는 말에서 배우고, '네'·'OK'·숫자처럼 글자로 안 갈리는 말에만 씀.
+   두 사람 음높이가 3반음 이상 차이 날 때만 판정함: 혼자 두 언어로 테스트하거나 같은 성별 둘이면
+   언어 차이를 사람 차이로 오인할 수 있음 (v0.4 실측: 혼자 중국어로 말했더니 '나=한국어'로 판정해 한국어로 들으려 함). */
 
 import { detectPitch, rmsDb } from './audio.js';
 
@@ -137,9 +139,19 @@ export class VoiceProfiles {
     if (arr.length > this.max) arr.shift();
   }
 
-  /** @returns {boolean} 양쪽 다 1개 이상 배워서 판정 가능 (확신도 문턱이 오판을 막음) */
+  /** @returns {boolean} 양쪽 다 1개 이상 배웠고, 음높이로 다른 사람임이 분명해 판정 가능 */
   get ready() {
-    return this.sides.left.length >= 1 && this.sides.right.length >= 1;
+    return this.sides.left.length >= 1 && this.sides.right.length >= 1 && this.separable();
+  }
+
+  /**
+   * 두 쪽이 목소리로 구분되는 다른 사람인가: 대표 음높이 차이 ≥ 3반음 (남 120Hz vs 여 200Hz ≈ 8.8반음,
+   * 같은 사람이 언어만 바꾸면 보통 1~2반음 이내).
+   * @returns {boolean}
+   */
+  separable() {
+    const l = this.pitch('left'), r = this.pitch('right');
+    return !!(l && r && Math.abs(12 * Math.log2(l / r)) >= 3);
   }
 
   /**

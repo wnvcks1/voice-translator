@@ -117,3 +117,10 @@ test('interpret: 429 는 status 달린 에러', async () => {
   globalThis.fetch = async () => new Response(JSON.stringify({ error: { message: 'quota' } }), { status: 429 });
   await assert.rejects(interpret({ key: 'k', model: 'm', wav: new Uint8Array(4), a: 'ko', b: 'zh' }), (e) => e.status === 429);
 });
+
+test('buildPrompt: 목소리 힌트 없음, 언어는 실제 말한 내용으로만 판단하라고 지시', () => {
+  const t = buildPrompt('ko', 'zh', []);
+  assert.doesNotMatch(t, /Voice analysis/);
+  assert.match(t, /ONLY from what is actually said/);
+  assert.match(t, /same person may speak either language/);
+});

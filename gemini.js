@@ -101,13 +101,11 @@ async function apiError(res) {
  * @param {{src:string, dst:string, lang:string}[]} history 최근 대화 (용어 일관성용)
  * @returns {string}
  */
-export function buildPrompt(a, b, history = [], hint = null) {
+export function buildPrompt(a, b, history = []) {
   const A = LANGS[a].en, B = LANGS[b].en;
   const ctx = history.length
     ? `\nRecent conversation for context (do not output it):\n${history.map((h) => `- [${h.lang}] ${h.src} => ${h.dst}`).join('\n')}\n`
     : '';
-  // 목소리 분석 결과: '네'·'OK'·숫자처럼 언어가 애매한 짧은 말에서만 참고하라고 알려 줌
-  const voice = hint ? `\nVoice analysis: this voice most likely belongs to the ${LANGS[hint].en} speaker. Use this ONLY to break a tie when the utterance is too short or ambiguous to tell the language.\n` : '';
   return `You are a live interpreter between ${A} (code "${a}") and ${B} (code "${b}").
 The audio contains ONE short utterance spoken in either ${A} or ${B}.
 Output exactly these 4 lines, in this order, and nothing else:
@@ -116,7 +114,8 @@ G|<male|female|unknown — the speaker's voice>
 S|<verbatim transcription in the spoken language and its own script. Do NOT translate on this line.>
 T|<natural, spoken-style translation into the other language (${a}->${b} or ${b}->${a})>
 Rules: one line each, no line breaks inside S or T, no quotes, no notes. Keep names and numbers exact.
-If it is only noise, a cough or silence, output L|none and leave S and T empty.${voice}${ctx}`;
+Decide the language ONLY from what is actually said. The same person may speak either language.
+If it is only noise, a cough or silence, output L|none and leave S and T empty.${ctx}`;
 }
 
 /**
@@ -157,7 +156,7 @@ export function toBase64(bytes) {
 
 /**
  * 음성 1건을 통역함. 스트리밍으로 받으며 onPartial 로 중간 결과를 계속 알림.
- * @param {{key:string, model:string, wav:Uint8Array, a:string, b:string, hint?:string|null,
+ * @param {{key:string, model:string, wav:Uint8Array, a:string, b:string,
  *          history?:object[], onPartial?:(p:object)=>void, signal?:AbortSignal}} o
  * @returns {Promise<{lang:string, gender:string, src:string, dst:string, ms:number}>}
  */
@@ -173,7 +172,7 @@ export async function interpret(o) {
         role: 'user',
         parts: [
           { inlineData: { mimeType: 'audio/wav', data: toBase64(o.wav) } },
-          { text: buildPrompt(o.a, o.b, o.history, o.hint) },
+          { text: buildPrompt(o.a, o.b, o.history) },
         ],
       }],
       generationConfig,

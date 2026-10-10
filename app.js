@@ -8,7 +8,7 @@ import { Speaker, loadVoices } from './tts.js';
 import { LiveSession, PcmPlayer, scriptLang, SCRIPT_OF, EchoGuard } from './live.js';
 import { voiceFeatures, VoiceProfiles } from './voice.js';
 
-const VERSION = 'v0.4';
+const VERSION = 'v0.4.1';
 const $ = (id) => document.getElementById(id);
 const SKEY = 'dt-settings';
 
@@ -177,8 +177,9 @@ async function handleUtterance(u) {
   const t0 = performance.now();
   let firstText = 0;
   const feat = voiceFeatures(u.pcm, 16000);
+  // 목소리 판정은 Gemini 에 알려 주지 않음: 알려 주면 그 언어로 들으려 해서 중국어를 한국어로 받아적음 (v0.4 실측)
   const guess = voices.classify(feat);
-  const hint = guess.conf >= VOICE_CONF ? (guess.side === 'left' ? a : b) : null;
+  const byVoice = guess.conf >= VOICE_CONF ? (guess.side === 'left' ? a : b) : null;
   inflight++;
   setStatus(idleText(), bgText());
 
@@ -195,7 +196,7 @@ async function handleUtterance(u) {
     for (const m of modelQueue()) {
       model = m;
       try {
-        r = await interpret({ key: S.key, model: m, wav: u.wav, a, b, hint, history: history.slice(-4), onPartial });
+        r = await interpret({ key: S.key, model: m, wav: u.wav, a, b, history: history.slice(-4), onPartial });
         break;
       } catch (e) {
         if (e.status !== 429 && e.status !== 503) throw e;
@@ -218,7 +219,7 @@ async function handleUtterance(u) {
       return sl === SCRIPT_OF[a] ? a : sl === SCRIPT_OF[b] ? b : null;
     };
     const byScript = scriptOf(r.src);
-    const lang = byScript || (r.lang === a || r.lang === b ? r.lang : null) || hint;
+    const lang = byScript || (r.lang === a || r.lang === b ? r.lang : null) || byVoice;
     if (!lang || !r.dst || r.lang === 'none') {
       card.el.remove();
       log(`#${id} 무시 (lang=${r.lang}, ${Math.round(r.ms)}ms) raw=${JSON.stringify(r.raw).slice(0, 120)}`);
