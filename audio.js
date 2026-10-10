@@ -45,7 +45,7 @@ export function rmsDb(frame) {
  * @param {number} [maxHz=400]
  * @returns {{f0:number, clarity:number}|null} 무성음·무음이면 null
  */
-export function detectPitch(frame, sampleRate, minHz = 70, maxHz = 400) {
+export function detectPitch(frame, sampleRate, minHz = 60, maxHz = 400) {
   const n = frame.length;
   const minLag = Math.floor(sampleRate / maxHz);
   const maxLag = Math.min(Math.floor(sampleRate / minHz), n - 1);
@@ -69,6 +69,7 @@ export function detectPitch(frame, sampleRate, minHz = 70, maxHz = 400) {
     cmnd[lag] = running > 0 ? (d[lag] * lag) / running : 1;
   }
 
+  // 1차: 문턱 아래 첫 골짜기. 2차: 실제 목소리(잡음 제거·압축 거친 소리)는 문턱을 못 넘기도 해서 전체 최솟값으로 보완
   const threshold = 0.2;
   let best = -1;
   for (let lag = minLag; lag <= maxLag; lag++) {
@@ -78,7 +79,15 @@ export function detectPitch(frame, sampleRate, minHz = 70, maxHz = 400) {
       break;
     }
   }
-  if (best < 0) return null;
+  if (best < 0) {
+    let min = Infinity;
+    for (let lag = minLag; lag <= maxLag; lag++) if (cmnd[lag] < min) min = cmnd[lag];
+    if (min > 0.45) return null;
+    // 전체 최솟값은 2배 주기(한 옥타브 아래)에 걸리기 쉬움 → 최솟값과 비슷한 골짜기 중 가장 짧은 주기를 택함
+    for (let lag = minLag + 1; lag < maxLag; lag++) {
+      if (cmnd[lag] <= min + 0.06 && cmnd[lag] <= cmnd[lag - 1] && cmnd[lag] <= cmnd[lag + 1]) { best = lag; break; }
+    }
+  }
 
   // 포물선 보간으로 lag 정밀화
   let lag = best;
@@ -113,9 +122,9 @@ export function estimateGender(pcm, sampleRate, opts = {}) {
     const fr = pcm.subarray(i, i + frameLen);
     if (rmsDb(fr) < peakDb - 30) continue;
     const p = detectPitch(fr, sampleRate);
-    if (p && p.clarity > 0.6) f0s.push(p.f0);
+    if (p && p.clarity > 0.55) f0s.push(p.f0);
   }
-  if (f0s.length < 5) return { gender: 'unknown', f0: null, voicedFrames: f0s.length };
+  if (f0s.length < 4) return { gender: 'unknown', f0: null, voicedFrames: f0s.length };
   f0s.sort((a, b) => a - b);
   const f0 = f0s[Math.floor(f0s.length / 2)];
   const gender = f0 <= maleMax ? 'male' : f0 >= femaleMin ? 'female' : 'unknown';
@@ -153,12 +162,17 @@ export function createVad(cfg) {
     get noiseFloor() { return floor; },
     get active() { return inSpeech; },
     reset() { reset(); pre = []; },
+    /** 주변 소음 다시 측정 (마이크를 다시 잡은 뒤) */
+    recalibrate() { reset(); pre = []; seen = 0; },
     /**
      * @param {Float32Array} frame
      * @returns {{type:'none'|'start'|'end'|'discard', frames?:Float32Array[], db:number}}
      */
     push(frame) {
       const db = rmsDb(frame);
+      // 마이크를 막 잡았을 때 들어오는 완전 무음(0) 프레임은 바닥 계산에서 뺌: 바닥이 -150dB 로 꺼지면
+      // 평소 실내 소음도 말로 오인해 문장이 안 끝남 (v0.2 e2e 에서 2번째 문장이 11.7초로 늘어난 원인)
+      if (db < -90) return { type: 'none', db };
       if (!inSpeech) {
         // 켜자마자 0.3초는 주변 소음 측정만 함 (시끄러운 식당에서 켜도 바로 오작동 안 하게)
         if (seen < calibFrames) {
@@ -240,32 +254,47 @@ export function concat(frames) {
 
 /**
  * 브라우저 마이크 캡처. 프레임(16kHz) 단위로 VAD 를 돌리고 발화가 끝나면 onUtterance 호출.
- * @param {{onUtterance:(u:{pcm:Float32Array, wav:Uint8Array, durationMs:number, gender:object})=>void,
- *          onLevel?:(db:number, floor:number, active:boolean)=>void,
- *          onSpeechStart?:()=>void, vad?:object}} handlers
+ * 재생할 땐 release() 로 마이크를 완전히 놓음: Android 는 마이크(에코 제거)를 잡고 있는 동안
+ * 통화 모드로 바뀌어 TTS 가 작게 나오거나 아예 안 나오는 기기가 있음.
+ * @param {{onUtterance?:(u:{pcm:Float32Array, wav:Uint8Array, durationMs:number, gender:object})=>void,
+ *          onFrame?:(frame:Float32Array)=>void, onLevel?:(db:number, floor:number, active:boolean)=>void,
+ *          onSpeechStart?:()=>void, onDiscard?:()=>void, vad?:object}} handlers
  */
 export async function startMic(handlers) {
-  const stream = await navigator.mediaDevices.getUserMedia({
-    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
-  });
   const ctx = new (window.AudioContext || window.webkitAudioContext)();
   if (ctx.state === 'suspended') await ctx.resume();
-  const src = ctx.createMediaStreamSource(stream);
   const proc = ctx.createScriptProcessor(2048, 1, 1);
   const frameMs = (2048 / ctx.sampleRate) * 1000;
   const vad = createVad({ frameMs, ...(handlers.vad || {}) });
   let paused = false;
+  let stream = null;
+  let src = null;
+
+  const acquire = async () => {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
+    });
+    src = ctx.createMediaStreamSource(stream);
+    src.connect(proc);
+  };
+  const drop = () => {
+    try { src?.disconnect(); } catch { /* 이미 끊김 */ }
+    stream?.getTracks().forEach((t) => t.stop());
+    stream = null; src = null;
+  };
 
   proc.onaudioprocess = (e) => {
+    if (!src) return;
     const raw = e.inputBuffer.getChannelData(0);
     const frame = resample(new Float32Array(raw), ctx.sampleRate, TARGET_RATE);
     if (paused) { handlers.onLevel?.(rmsDb(frame), vad.noiseFloor, false); return; }
+    handlers.onFrame?.(frame);
     const ev = vad.push(frame);
     // 화면 갱신 오류가 발화 처리를 막지 않게 격리
     try { handlers.onLevel?.(ev.db, vad.noiseFloor, vad.active); } catch { /* 표시만 실패 */ }
     if (ev.type === 'start') handlers.onSpeechStart?.();
     if (ev.type === 'discard') handlers.onDiscard?.();
-    if (ev.type === 'end') {
+    if (ev.type === 'end' && handlers.onUtterance) {
       const pcm = concat(ev.frames);
       handlers.onUtterance({
         pcm,
@@ -275,7 +304,7 @@ export async function startMic(handlers) {
       });
     }
   };
-  src.connect(proc);
+  await acquire();
   // ScriptProcessor 는 destination 에 연결돼야 콜백이 돎. 무음 gain 으로 하울링 방지
   const mute = ctx.createGain();
   mute.gain.value = 0;
@@ -283,13 +312,18 @@ export async function startMic(handlers) {
 
   return {
     ctx,
-    /** TTS 재생 중엔 자기 목소리를 다시 번역하지 않게 멈춤 */
+    /** 재생 중 자기 목소리 재번역 방지: 데이터만 버림 (마이크는 유지) */
     pause() { paused = true; vad.reset(); },
     resume() { paused = false; },
     get paused() { return paused; },
+    /** 마이크 장치를 완전히 놓음 (Android 통화 모드 해제 → 스피커 정상 출력) */
+    release() { paused = true; vad.reset(); drop(); },
+    /** release 후 다시 잡음 */
+    async reacquire() { if (!stream) await acquire(); vad.recalibrate(); paused = false; },
+    get released() { return !stream; },
     stop() {
-      proc.disconnect(); src.disconnect();
-      stream.getTracks().forEach((t) => t.stop());
+      drop();
+      proc.disconnect();
       ctx.close();
     },
   };

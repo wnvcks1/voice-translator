@@ -11,51 +11,72 @@ export const LANGS = {
   es: { name: '스페인어', native: 'Español', en: 'Spanish', bcp: 'es-ES' },
 };
 
+const ver = (n) => {
+  const m = n.match(/gemini-(\d+(?:\.\d+)?)/);
+  return m ? parseFloat(m[1]) : 0;
+};
+
 /**
- * 모델 목록에서 번역용·TTS용 모델을 자동으로 고름. 모델명이 자주 바뀌므로 하드코딩 대신 목록 기반.
- * @param {string[]} names 'models/' 접두어를 뗀 generateContent 지원 모델명들
- * @returns {{chat:string|null, tts:string|null}}
+ * 모델 목록에서 번역용·TTS용·실시간 번역용 모델을 고름. 모델명이 자주 바뀌므로 하드코딩 대신 목록 기반.
+ * 번역은 Flash-Lite 우선: 무료 일일 한도가 Flash 보다 훨씬 크고 응답도 빠름.
+ * @param {string[]} names generateContent 지원 모델명 ('models/' 뗀 것)
+ * @param {string[]} [bidi] bidiGenerateContent(Live API) 지원 모델명
+ * @returns {{chat:string|null, chatList:string[], tts:string|null, live:string|null}}
  */
-export function pickModels(names) {
-  const ver = (n) => {
-    const m = n.match(/gemini-(\d+(?:\.\d+)?)/);
-    return m ? parseFloat(m[1]) : 0;
-  };
-  const stable = (n) => !/(preview|exp|image|tts|live|audio|embedding|thinking)/.test(n);
-  let chat = null;
-  if (names.includes('gemini-flash-latest')) chat = 'gemini-flash-latest';
-  else {
-    const flash = names.filter((n) => /^gemini-[\d.]+-flash$/.test(n)).sort((a, b) => ver(b) - ver(a));
-    const anyFlash = names.filter((n) => /flash/.test(n) && !/lite/.test(n) && stable(n)).sort((a, b) => ver(b) - ver(a));
-    const lite = names.filter((n) => /flash-lite/.test(n) && stable(n)).sort((a, b) => ver(b) - ver(a));
-    const preview = names.filter((n) => /^gemini-[\d.]+-flash-preview/.test(n)).sort((a, b) => ver(b) - ver(a));
-    chat = flash[0] || anyFlash[0] || lite[0] || preview[0] || null;
-  }
+export function pickModels(names, bidi = []) {
+  const usable = (n) => /^gemini-/.test(n) && !/(tts|image|live|audio|embedding|thinking|computer|robotics|translate|transcribe)/.test(n);
+  const byVer = (a, b) => ver(b) - ver(a);
+  const has = (n) => names.includes(n);
+  const lite = names.filter((n) => usable(n) && /flash-lite$/.test(n)).sort(byVer);
+  const flash = names.filter((n) => usable(n) && /^gemini-[\d.]+-flash$/.test(n)).sort(byVer);
+  const previews = names.filter((n) => usable(n) && /flash/.test(n) && /preview/.test(n)).sort(byVer);
+  const chatList = [...new Set([
+    ...(has('gemini-flash-lite-latest') ? ['gemini-flash-lite-latest'] : []),
+    ...lite, ...flash,
+    ...(has('gemini-flash-latest') ? ['gemini-flash-latest'] : []),
+    ...previews,
+  ])];
   const tts = names.filter((n) => /tts/.test(n) && !/pro/.test(n))
-    .sort((a, b) => ver(b) - ver(a) || Number(/preview/.test(a)) - Number(/preview/.test(b)));
-  return { chat, tts: tts[0] || null };
+    .sort((a, b) => byVer(a, b) || Number(/preview/.test(a)) - Number(/preview/.test(b)));
+  const live = bidi.filter((n) => /translate/.test(n)).sort(byVer);
+  return { chat: chatList[0] || null, chatList, tts: tts[0] || null, live: live[0] || null };
 }
 
 /**
  * 키로 사용 가능한 모델 목록을 받음.
  * @param {string} key
- * @returns {Promise<string[]>}
+ * @returns {Promise<{gen:string[], bidi:string[]}>}
  */
 export async function listModels(key) {
-  const out = [];
+  const gen = [], bidi = [];
   let page = '';
   for (let i = 0; i < 5; i++) {
     const res = await fetch(`${BASE}/models?pageSize=200${page ? `&pageToken=${page}` : ''}`, { headers: { 'x-goog-api-key': key } });
     if (!res.ok) throw await apiError(res);
     const j = await res.json();
     for (const m of j.models || []) {
-      if ((m.supportedGenerationMethods || []).includes('generateContent')) out.push(m.name.replace(/^models\//, ''));
+      const name = m.name.replace(/^models\//, '');
+      const ms = m.supportedGenerationMethods || [];
+      if (ms.includes('generateContent')) gen.push(name);
+      if (ms.includes('bidiGenerateContent')) bidi.push(name);
     }
     if (!j.nextPageToken) break;
     page = j.nextPageToken;
   }
-  return out;
+  return { gen, bidi };
 }
+
+/**
+ * thinking(생각) 끄는 설정 후보. 세대마다 받는 필드가 달라서 차례로 시도하고 통한 것을 기억함.
+ * @param {string} model
+ * @returns {(object|null)[]}
+ */
+export function thinkingVariants(model) {
+  const v = ver(model);
+  if (v >= 3 || /latest/.test(model)) return [{ thinkingLevel: 'minimal' }, { thinkingBudget: 0 }, null];
+  return [{ thinkingBudget: 0 }, null];
+}
+const thinkingMemo = new Map();
 
 /**
  * 오류 응답을 사람이 읽을 수 있는 Error 로 변환함.
@@ -140,31 +161,31 @@ export function toBase64(bytes) {
  */
 export async function interpret(o) {
   const t0 = performance.now();
-  const body = {
-    contents: [{
-      role: 'user',
-      parts: [
-        { inlineData: { mimeType: 'audio/wav', data: toBase64(o.wav) } },
-        { text: buildPrompt(o.a, o.b, o.history) },
-      ],
-    }],
-    generationConfig: { temperature: 0.2, maxOutputTokens: 600 },
-  };
-  // 생각(thinking) 끄기 = 지연 감소. 모델이 거부하면 빼고 한 번 더 시도
-  if (o.noThinking !== false) body.generationConfig.thinkingConfig = { thinkingBudget: 0 };
-
-  const url = `${BASE}/models/${o.model}:streamGenerateContent?alt=sse`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': o.key },
-    body: JSON.stringify(body),
-    signal: o.signal,
-  });
-  if (!res.ok) {
+  const variants = thinkingMemo.has(o.model) ? [thinkingMemo.get(o.model)] : thinkingVariants(o.model);
+  let res = null;
+  for (let i = 0; i < variants.length; i++) {
+    const generationConfig = { temperature: 0.2, maxOutputTokens: 600 };
+    if (variants[i]) generationConfig.thinkingConfig = variants[i];
+    const body = {
+      contents: [{
+        role: 'user',
+        parts: [
+          { inlineData: { mimeType: 'audio/wav', data: toBase64(o.wav) } },
+          { text: buildPrompt(o.a, o.b, o.history) },
+        ],
+      }],
+      generationConfig,
+    };
+    res = await fetch(`${BASE}/models/${o.model}:streamGenerateContent?alt=sse`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': o.key },
+      body: JSON.stringify(body),
+      signal: o.signal,
+    });
+    if (res.ok) { thinkingMemo.set(o.model, variants[i]); break; }
     const err = await apiError(res);
-    if (err.status === 400 && o.noThinking !== false && /thinking/i.test(err.message)) {
-      return interpret({ ...o, noThinking: false });
-    }
+    // 생각 설정만 거부된 경우에만 다음 후보로. 그 외 오류(한도 초과 등)는 바로 올림
+    if (err.status === 400 && /think/i.test(err.message) && i < variants.length - 1) continue;
     throw err;
   }
 

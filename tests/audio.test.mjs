@@ -70,6 +70,38 @@ test('estimateGender: 기본음 누락(전화 대역 흉내)에도 남성 판정
   assert.equal(g.gender, 'male', `f0=${g.f0}`);
 });
 
+/** 실제 목소리에 가깝게: 주기 흔들림(jitter)·음량 흔들림·성도 공명(간이 필터)·잡음 */
+function realish(f0, sec, seed = 3, noise = 0.01, jit = 0.02) {
+  const r = rng(seed);
+  const n = Math.round(SR * sec);
+  const out = new Float32Array(n);
+  let t = 0, period = SR / f0;
+  // 성문 펄스열 → 2차 공명 필터 2개(포먼트 ~700Hz, ~1200Hz)
+  let y1 = 0, y2 = 0, z1 = 0, z2 = 0;
+  const reson = (f, bw) => { const R = Math.exp(-Math.PI * bw / SR); return [2 * R * Math.cos(2 * Math.PI * f / SR), -R * R]; };
+  const [a1, a2] = reson(700, 120), [b1, b2] = reson(1200, 150);
+  for (let i = 0; i < n; i++) {
+    let x = 0;
+    if (i >= t) { x = 1; period = (SR / f0) * (1 + jit * r()); t += period; }
+    const y = x + a1 * y1 + a2 * y2; y2 = y1; y1 = y;
+    const z = y + b1 * z1 + b2 * z2; z2 = z1; z1 = z;
+    const env = 0.6 + 0.4 * Math.sin((2 * Math.PI * 4 * i) / SR);
+    out[i] = 0.02 * env * z + noise * r();
+  }
+  return out;
+}
+
+test('estimateGender: 흔들림·공명·잡음 심한 목소리도 판정, 한 옥타브 아래로 안 틀림 (v0.1 실측 "피치?" 대응)', () => {
+  // v0.1 판정기는 jitter 6%·잡음 0.06 에서 98/125Hz 를 unknown, 215Hz 를 male 로 틀렸음
+  for (const [f0, want] of [[98, 'male'], [125, 'male'], [215, 'female']]) {
+    for (const [noise, jit] of [[0.01, 0.02], [0.06, 0.06], [0.1, 0.06]]) {
+      const g = estimateGender(realish(f0, 1.5, 7, noise, jit), SR);
+      assert.equal(g.gender, want, `${f0}Hz noise ${noise} jit ${jit} → ${g.f0}`);
+      assert.ok(Math.abs(g.f0 - f0) / f0 < 0.08, `${f0}Hz noise ${noise} jit ${jit} → f0 ${g.f0}`);
+    }
+  }
+});
+
 test('estimateGender: 경계 구간(170Hz)은 판단 보류, 잡음만이면 unknown', () => {
   assert.equal(estimateGender(voice(170, 1.2, { vibrato: 0.01 }), SR).gender, 'unknown');
   assert.equal(estimateGender(noise(1), SR).gender, 'unknown');
@@ -148,4 +180,13 @@ test('resample: 48k→16k 길이와 주파수 보존', () => {
 test('VAD: 켜는 도중 소음이 갑자기 커져 계속돼도 최대 길이 1번 끊긴 뒤 멈춤', () => {
   const ev = runVad(concat([noise(1, 0.002), noise(12, 0.05)]), { maxMs: 3000 });
   assert.ok(ev.filter((e) => e.type === 'end' || e.type === 'discard').length <= 1, ev.map((e) => e.type).join(','));
+});
+
+test('VAD: 마이크 재연결 직후 완전 무음 프레임이 와도 다음 말이 정상 길이로 끝남', () => {
+  const sig = concat([noise(1), new Float32Array(SR * 0.5), voice(200, 1.2), noise(2)]);
+  const ev = runVad(sig);
+  const end = ev.find((e) => e.type === 'end');
+  assert.ok(end, ev.map((e) => e.type).join(','));
+  const dur = concat(end.frames).length / SR;
+  assert.ok(dur < 2.4, `dur ${dur}`);
 });

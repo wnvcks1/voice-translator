@@ -39,8 +39,9 @@ header{display:flex;align-items:center;justify-content:space-between;padding:10p
   box-shadow:0 0 80px rgba(120,90,180,.25);transition:transform .08s linear}
 
 .turn{max-width:92%;background:var(--card);border-radius:18px;padding:12px 14px;position:relative}
-.turn.me{align-self:flex-end;border-top-right-radius:6px;border-right:3px solid var(--me)}
-.turn.them{align-self:flex-start;border-top-left-radius:6px;border-left:3px solid var(--them)}
+/* 한국어로 말한 카드는 왼쪽(위 한국어 버튼 쪽), 상대 언어는 오른쪽 */
+.turn.left{align-self:flex-start;border-top-left-radius:6px;border-left:3px solid var(--me)}
+.turn.right{align-self:flex-end;border-top-right-radius:6px;border-right:3px solid var(--them)}
 .turn .src{font-size:19px;line-height:1.45;word-break:keep-all;overflow-wrap:anywhere}
 .turn .dst{font-size:17px;line-height:1.45;color:#c9b8ff;margin-top:6px;padding-top:6px;border-top:1px solid var(--line);word-break:keep-all;overflow-wrap:anywhere}
 .turn .meta{font-size:11px;color:var(--sub);margin-top:6px;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
@@ -133,7 +134,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:10p
   </button>
   <button class="ctrl" id="btnShow" aria-label="상대에게 크게 보여주기" disabled>🔍</button>
 </div>
-<div class="foot">내용은 AI 가 생성함 · Gemini</div>
+<div class="foot">내용은 AI 가 생성함 · Gemini · v0.2</div>
 
 <div id="show">
   <div class="big" id="showBig"></div>
@@ -158,9 +159,24 @@ header{display:flex;align-items:center;justify-content:space-between;padding:10p
       </div>
     </div>
 
+    <div class="toggle"><span>실시간 모드 (베타)<br><small class="note">말하는 도중에 번역 음성이 나옴 · Gemini Live Translate · 끄면 문장 모드(말이 끝나면 번역)</small></span><input type="checkbox" id="liveMode"></div>
+    <div class="field" style="margin-top:10px">
+      <label>실시간 번역 모델</label>
+      <select id="liveModel"></select>
+    </div>
+
     <div class="field">
-      <label>번역 모델 (자동 선택됨)</label>
+      <label>문장 모드 번역 모델 (한도 초과 시 다음 모델로 자동 전환)</label>
       <select id="chatModel"></select>
+    </div>
+
+    <div class="field">
+      <label>목소리 성별 (자동 = 음높이로 판정)</label>
+      <div class="row">
+        <select id="meGender"><option value="auto">나: 자동</option><option value="male">나: 남자</option><option value="female">나: 여자</option></select>
+        <select id="themGender"><option value="auto">상대: 자동</option><option value="male">상대: 남자</option><option value="female">상대: 여자</option></select>
+      </div>
+      <div class="note">실시간 모드에서 자동이면 모델 기본 목소리(원래 말투를 따라간다고 알려짐). 남/여로 고르면 그 목소리로 고정</div>
     </div>
 
     <div class="toggle"><span>AI 음성으로 재생<br><small class="note">자연스럽고 남녀 구분 확실 · 1~2초 더 걸림 · 하루 사용량 제한 있음</small></span><input type="checkbox" id="aiVoice"></div>
@@ -187,6 +203,12 @@ header{display:flex;align-items:center;justify-content:space-between;padding:10p
     <div class="field">
       <label>남/여 판정 기준 음높이 (Hz) — 남 ≤ <span id="mVal"></span>, 여 ≥ <span id="fVal"></span></label>
       <div class="row"><input type="range" id="maleMax" min="120" max="190" step="5"><input type="range" id="femaleMin" min="150" max="230" step="5"></div>
+    </div>
+
+    <div class="field">
+      <label>소리 확인</label>
+      <button class="btn" id="btnSound">🔊 소리 테스트 (한국어 → 상대 언어)</button>
+      <div class="note">안 들리면: 폰 미디어 볼륨 확인 → 삼성 설정 › 일반 › 텍스트 음성 변환 › 기본 엔진을 Google 로, 중국어 음성 데이터 설치</div>
     </div>
 
     <div class="field">

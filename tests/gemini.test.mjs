@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseLines, pickModels, buildPrompt, sseText, toBase64, interpret } from '../gemini.js';
+import { parseLines, pickModels, buildPrompt, sseText, toBase64, interpret, thinkingVariants } from '../gemini.js';
 
 test('parseLines: 완성된 4줄', () => {
   const p = parseLines('L|zh\nG|female\nS|你好，请问洗手间在哪里？\nT|안녕하세요, 화장실이 어디예요?\n');
@@ -33,21 +33,29 @@ test('parseLines: 잡음 응답', () => {
   assert.equal(p.dst, '');
 });
 
-test('pickModels: latest 별칭 우선, TTS 는 pro 제외·최신', () => {
-  const r = pickModels(['gemini-2.5-flash', 'gemini-flash-latest', 'gemini-3.1-flash-tts-preview', 'gemini-3.8-flash-lite-tts', 'gemini-2.5-pro-preview-tts']);
-  assert.equal(r.chat, 'gemini-flash-latest');
+test('pickModels: Flash-Lite 우선, 나머지는 한도 초과 대비 후보 순서', () => {
+  const r = pickModels(['gemini-2.5-flash', 'gemini-flash-latest', 'gemini-3.1-flash-lite', 'gemini-2.5-flash-lite', 'gemini-flash-lite-latest',
+    'gemini-3.1-flash-tts-preview', 'gemini-3.8-flash-lite-tts', 'gemini-2.5-pro-preview-tts', 'gemini-3.5-transcribe']);
+  assert.equal(r.chat, 'gemini-flash-lite-latest');
+  assert.deepEqual(r.chatList, ['gemini-flash-lite-latest', 'gemini-3.1-flash-lite', 'gemini-2.5-flash-lite', 'gemini-2.5-flash', 'gemini-flash-latest']);
   assert.equal(r.tts, 'gemini-3.8-flash-lite-tts');
 });
 
-test('pickModels: 별칭 없으면 가장 높은 버전 flash', () => {
-  const r = pickModels(['gemini-2.0-flash', 'gemini-2.5-flash', 'gemini-3-flash-preview', 'gemini-2.5-flash-lite']);
-  assert.equal(r.chat, 'gemini-2.5-flash');
-  assert.equal(r.tts, null);
+test('pickModels: 실시간 번역 모델은 bidi 목록에서', () => {
+  const r = pickModels(['gemini-2.5-flash'], ['gemini-live-2.5-flash', 'gemini-3.5-live-translate-preview']);
+  assert.equal(r.live, 'gemini-3.5-live-translate-preview');
+  assert.equal(pickModels(['gemini-2.5-flash'], []).live, null);
 });
 
-test('pickModels: flash 가 preview 뿐이어도 무언가 고름', () => {
+test('pickModels: flash 가 preview 뿐이어도 고르고, 없으면 null', () => {
   assert.equal(pickModels(['gemini-3-flash-preview', 'gemma-3-27b-it']).chat, 'gemini-3-flash-preview');
   assert.equal(pickModels(['gemma-3-27b-it']).chat, null);
+});
+
+test('thinkingVariants: 3세대는 thinkingLevel 먼저, 2세대는 budget', () => {
+  assert.deepEqual(thinkingVariants('gemini-3.1-flash-lite')[0], { thinkingLevel: 'minimal' });
+  assert.deepEqual(thinkingVariants('gemini-2.5-flash-lite')[0], { thinkingBudget: 0 });
+  assert.equal(thinkingVariants('gemini-2.5-flash').at(-1), null);
 });
 
 test('buildPrompt: 두 언어 코드와 맥락 포함', () => {
@@ -84,7 +92,7 @@ test('interpret: 스트리밍 조각을 이어 붙이고 중간 결과 알림', 
   const calls = [];
   globalThis.fetch = async (url, init) => { calls.push({ url, body: JSON.parse(init.body) }); return sseResponse(['L|zh\nG|fem', 'ale\nS|你好\nT|안녕', '하세요']); };
   const partials = [];
-  const r = await interpret({ key: 'k', model: 'm', wav: new Uint8Array(10), a: 'ko', b: 'zh', onPartial: (p) => partials.push(p) });
+  const r = await interpret({ key: 'k', model: 'gemini-2.5-flash-lite', wav: new Uint8Array(10), a: 'ko', b: 'zh', onPartial: (p) => partials.push(p) });
   assert.deepEqual([r.lang, r.gender, r.src, r.dst], ['zh', 'female', '你好', '안녕하세요']);
   assert.ok(partials.length >= 2);
   assert.match(calls[0].url, /streamGenerateContent\?alt=sse/);
@@ -92,7 +100,7 @@ test('interpret: 스트리밍 조각을 이어 붙이고 중간 결과 알림', 
   assert.equal(calls[0].body.generationConfig.thinkingConfig.thinkingBudget, 0);
 });
 
-test('interpret: thinking 설정 거부(400)면 빼고 재시도', async () => {
+test('interpret: thinking 설정 거부(400)면 다음 후보로, 끝내 빼고 성공', async () => {
   let n = 0;
   globalThis.fetch = async (url, init) => {
     n++;
@@ -100,8 +108,8 @@ test('interpret: thinking 설정 거부(400)면 빼고 재시도', async () => {
     if (b.generationConfig.thinkingConfig) return new Response(JSON.stringify({ error: { message: 'thinking_budget is not supported' } }), { status: 400 });
     return sseResponse(['L|ko\nG|male\nS|네\nT|好的\n']);
   };
-  const r = await interpret({ key: 'k', model: 'm', wav: new Uint8Array(4), a: 'ko', b: 'zh' });
-  assert.equal(n, 2);
+  const r = await interpret({ key: 'k', model: 'gemini-3.1-flash-lite', wav: new Uint8Array(4), a: 'ko', b: 'zh' });
+  assert.equal(n, 3);
   assert.equal(r.dst, '好的');
 });
 

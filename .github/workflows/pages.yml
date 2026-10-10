@@ -28,7 +28,7 @@ jobs:
       - name: 사이트 조립
         run: |
           mkdir -p site
-          cp index.html app.js audio.js gemini.js tts.js site/
+          cp index.html app.js audio.js gemini.js tts.js live.js site/
       - uses: actions/configure-pages@v5
         with:
           enablement: true

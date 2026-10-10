@@ -52,26 +52,38 @@ export function pickVoice(voices, bcp, gender, pinned = {}) {
 }
 
 /**
- * 재생기. 한 번에 하나만 재생하고, 재생 중에는 onBusy(true) 로 마이크를 멈추게 함.
+ * 재생기. 한 번에 하나만 재생하고, 재생 전 onBusy(true) 로 마이크를 놓게 함.
+ * 폰 음성이 시작조차 안 되면(음성 데이터 없음 등) AI 음성으로 자동 대체.
  */
 export class Speaker {
   /**
-   * @param {{onBusy:(busy:boolean)=>void, getSettings:()=>object, getAudioCtx:()=>AudioContext|null}} o
+   * @param {{onBusy:(busy:boolean)=>Promise<void>|void, getSettings:()=>object, onError?:(m:string)=>void}} o
    */
   constructor(o) {
     this.o = o;
     this.voices = [];
     this.queue = Promise.resolve();
     this.current = null;
+    this.ctx = null;
+    this.utt = null;
     loadVoices().then((v) => { this.voices = v; });
     if ('speechSynthesis' in window) speechSynthesis.addEventListener?.('voiceschanged', () => { this.voices = speechSynthesis.getVoices(); });
   }
 
+  /** 재생용 AudioContext. 반드시 사용자 터치 안에서 처음 만들어야 Android 가 소리를 막지 않음 */
+  audioCtx() {
+    if (!this.ctx || this.ctx.state === 'closed') this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    if (this.ctx.state === 'suspended') this.ctx.resume().catch(() => {});
+    return this.ctx;
+  }
+
   /** 첫 재생은 사용자 터치 안에서 해야 Android 가 막지 않음 */
   unlock() {
+    this.audioCtx();
     if (!('speechSynthesis' in window)) return;
     const u = new SpeechSynthesisUtterance(' ');
     u.volume = 0;
+    this.utt = u;
     speechSynthesis.speak(u);
   }
 
@@ -85,49 +97,68 @@ export class Speaker {
    * @param {string} text
    * @param {string} bcp
    * @param {'male'|'female'|'unknown'} gender
-   * @returns {Promise<{engine:string, voice:string}>}
+   * @returns {Promise<{engine:string, voice:string, status:string}>}
    */
   say(text, bcp, gender) {
     const run = async () => {
       const s = this.o.getSettings();
-      this.o.onBusy(true);
+      await this.o.onBusy(true);
       try {
-        if (s.aiVoice && s.key && s.ttsModel) {
+        const canAi = s.key && s.ttsModel;
+        if (s.aiVoice && canAi) {
           try {
             return await this.sayAi(text, gender, s);
           } catch (e) {
-            this.o.onError?.(`AI 음성 실패 → 폰 음성으로 대체: ${e.message}`);
+            this.o.onError?.(`AI 음성 실패 → 폰 음성으로: ${e.message}`);
           }
         }
-        return await this.sayLocal(text, bcp, gender, s);
+        const r = await this.sayLocal(text, bcp, gender, s);
+        if (r.status !== 'ok' && !s.aiVoice && canAi) {
+          this.o.onError?.(`폰 음성 ${r.status} [${r.voice}] → AI 음성으로 대체`);
+          try { return await this.sayAi(text, gender, s); } catch (e) { this.o.onError?.(`AI 음성도 실패: ${e.message}`); }
+        }
+        return r;
       } finally {
         // 스피커 잔향이 마이크에 다시 잡히지 않게 약간 쉼
-        await new Promise((r) => setTimeout(r, 250));
-        this.o.onBusy(false);
+        await new Promise((r) => setTimeout(r, 200));
+        await this.o.onBusy(false);
       }
     };
     this.queue = this.queue.then(run, run);
     return this.queue;
   }
 
-  sayLocal(text, bcp, gender, s) {
+  /**
+   * 폰 내장 TTS. 결과 status: ok | nostart(시작 안 됨) | error:<코드>
+   */
+  async sayLocal(text, bcp, gender, s) {
+    if (!('speechSynthesis' in window)) return { engine: 'phone', voice: '-', status: 'unsupported' };
+    if (!this.voices.length) this.voices = speechSynthesis.getVoices();
+    const pinned = (s.voicePins || {})[bcp] || {};
+    const { voice, pitch } = pickVoice(this.voices, bcp, gender, pinned);
+    // Android Chrome: cancel 직후 바로 speak 하면 소리 없이 삼켜지는 버그 → 필요할 때만 cancel 후 잠깐 쉼
+    if (speechSynthesis.speaking || speechSynthesis.pending) {
+      speechSynthesis.cancel();
+      await new Promise((r) => setTimeout(r, 80));
+    }
+    if (speechSynthesis.paused) speechSynthesis.resume();
     return new Promise((resolve) => {
-      if (!('speechSynthesis' in window)) return resolve({ engine: 'none', voice: '-' });
-      if (!this.voices.length) this.voices = speechSynthesis.getVoices();
-      const pinned = (s.voicePins || {})[bcp] || {};
-      const { voice, pitch } = pickVoice(this.voices, bcp, gender, pinned);
       const u = new SpeechSynthesisUtterance(text);
       u.lang = bcp;
       try { if (voice) u.voice = voice; } catch { /* 일부 브라우저: 음성 객체 불일치 → lang 으로 대체 */ }
       u.pitch = pitch;
       u.rate = s.rate || 1;
-      let done = false;
-      const fin = () => { if (!done) { done = true; resolve({ engine: 'phone', voice: `${voice?.name || bcp} p${pitch}` }); } };
-      u.onend = fin;
-      u.onerror = fin;
+      // Chrome: 발화 객체가 GC 되면 onend 가 안 옴 → 참조 유지
+      this.utt = u;
+      const name = `${voice?.name || `(${bcp} 기본)`} p${pitch}`;
+      let started = false, done = false;
+      const fin = (status) => { if (!done) { done = true; resolve({ engine: 'phone', voice: name, status }); } };
+      u.onstart = () => { started = true; };
+      u.onend = () => fin(started ? 'ok' : 'nostart');
+      u.onerror = (e) => fin(`error:${e.error || '?'}`);
+      setTimeout(() => { if (!started) { speechSynthesis.cancel(); fin('nostart'); } }, 2500);
       // 일부 기기에서 onend 가 안 오는 버그 대비: 글자 수 기반 상한
-      setTimeout(fin, 2500 + text.length * 250);
-      speechSynthesis.cancel();
+      setTimeout(() => fin(started ? 'ok' : 'nostart'), 3000 + text.length * 300);
       speechSynthesis.speak(u);
     });
   }
@@ -136,7 +167,7 @@ export class Speaker {
     const g = gender === 'male' ? 'male' : 'female';
     const voice = (g === 'male' ? s.aiVoiceMale : s.aiVoiceFemale) || AI_VOICES[g][0];
     const { pcm, rate } = await aiSpeech({ key: s.key, model: s.ttsModel, text, voice });
-    const ctx = this.o.getAudioCtx() || new AudioContext();
+    const ctx = this.audioCtx();
     if (ctx.state === 'suspended') await ctx.resume();
     const buf = ctx.createBuffer(1, pcm.length, rate);
     const ch = buf.getChannelData(0);
@@ -151,6 +182,6 @@ export class Speaker {
       node.start();
     });
     this.current = null;
-    return { engine: 'ai', voice };
+    return { engine: 'ai', voice, status: 'ok' };
   }
 }
