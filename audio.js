@@ -153,6 +153,16 @@ export function detectPitch(frame, sampleRate, minHz = 60, maxHz = 400) {
     }
   }
 
+  // 한 옥타브 위 오류 보정: 폰 마이크는 남자 목소리의 기본음(~100Hz)을 약하게 잡아 2배음이 주기처럼 보임
+  // (v0.6 실측: 남자 목소리가 192·198Hz 로 재져 여자로 판정). 2배 주기에서 주기성이 확연히 더 좋으면 그쪽이 진짜.
+  // 진짜 고음(여자)은 2배 주기 주기성이 비슷한 수준이라 안 바뀜
+  const t2 = best * 2;
+  if (t2 + 2 <= maxLag) {
+    let b2 = t2;
+    for (let l = t2 - 2; l <= t2 + 2; l++) if (cmnd[l] < cmnd[b2]) b2 = l;
+    if (cmnd[b2] < cmnd[best] * 0.5) best = b2;
+  }
+
   // 포물선 보간으로 lag 정밀화
   let lag = best;
   if (lag > 1 && lag < maxLag) {

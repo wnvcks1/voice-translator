@@ -177,8 +177,8 @@ const MODELS = {
   check('[문장] 한도 초과 모델은 다음 발화에서 건너뜀', chatCalls[2]?.model === 'gemini-2.5-flash-lite', chatCalls[2]?.model);
   check('[문장] 한국어 카드는 왼쪽', turns[0]?.cls.includes('left') && turns[0].src === '이거 얼마예요?' && turns[0].dst === '这个多少钱？', JSON.stringify(turns[0]));
   check('[문장] 중국어 카드는 오른쪽', turns[1]?.cls.includes('right') && turns[1].src === '这个三十块。', JSON.stringify(turns[1]));
-  check('[문장] Gemini 가 여자라 해도 피치(120Hz)로 남성', /♂ 1[12]\dHz/.test(turns[0]?.meta || ''), turns[0]?.meta);
-  check('[문장] 피치(220Hz)로 여성', /♀ 2[12]\dHz/.test(turns[1]?.meta || ''), turns[1]?.meta);
+  check('[문장] Gemini 가 여자라 해도 피치(120Hz)로 남성', /#1 ko→zh .*피치 male\(1[12]\dHz\).*→ male/.test(log), (log.match(/#1 ko→zh.*/) || [''])[0]);
+  check('[문장] 피치(220Hz)로 여성', /#2 zh→ko .*피치 female\(2[12]\dHz\).*→ female/.test(log), (log.match(/#2 zh→ko.*/) || [''])[0]);
   check('[문장] 전화처럼 재생 중에도 마이크 계속 켜 둠', st.gum === 1 && st.stops === 0, `getUserMedia ${st.gum}회, 끈 횟수 ${st.stops}`);
   check('[문장] 문장 길이 정상 (말 끝 판정)', !/\d{5}ms음성/.test(log) && /#2 zh→ko [12]\d{3}ms음성/.test(log), (log.match(/#2 \S+ \d+ms음성/) || [''])[0]);
   check('[문장] 스피커로 나간 중국어가 다시 들리면 에코로 무시 (카드·소리 없음)', /에코 무시/.test(log) && turns.length === 2 && !spoken.some((x) => x.text === '이거 얼마예요?'), `카드 ${turns.length}개`);
@@ -189,12 +189,14 @@ const MODELS = {
   check('[문장] 두 번째 요청에 대화 맥락 포함', /이거 얼마예요\? => 这个多少钱？/.test(chatCalls[2]?.body.contents[0].parts[1].text || ''));
   check('[문장] 마이크 켠 채 계속 처리 (3번째 발화도 전송)', chatCalls.length === 4, `${chatCalls.length}건`);
   check('[분류] 문장 모드 요청에 목소리 힌트 없음 (중국어를 한국어로 듣는 편향 방지)', chatCalls.every((c) => !/Voice analysis/.test(c.body.contents[0].parts[1].text)), '');
-  check('[문장] 카드에 분류 근거(글자) 표시', /분류 글자/.test(turns[0]?.meta || '') && /분류 글자/.test(turns[1]?.meta || ''), turns.map((t) => t.meta).join(' / '));
-  check('[통화] 통화 시간 표시', /통화 중 00:\d\d/.test(await page.textContent('#pillText')), await page.textContent('#pillText'));
+  check('[문장] 분류 근거는 로그에 (글자)', (log.match(/분류 글자/g) || []).length >= 2, '');
+  check('[화면] 카드엔 성별·Hz·시간·모델 줄 없음, 버튼만', turns.every((t) => !/Hz|분류|첫글자|완료|flash/.test(t.meta)) && /다시/.test(turns[0]?.meta || ''), turns.map((t) => t.meta).join(' / '));
+  check('[화면] 위쪽 통화중·시간, 아래쪽 AI 문구 없음', !(await page.$('#pillText')) && !(await page.$('.foot')) && !/내용은 AI/.test(await page.textContent('body')), '');
+  check('[화면] 버전은 설정 제목에', (await page.textContent('#ver')) === 'v0.7', await page.textContent('#ver'));
   check('[통화] 마이크 정보 기록 (오디오 스레드·앨리어싱 필터)', /마이크: 오디오 스레드 · \d+Hz→16k\(앨리어싱 필터\)/.test(log), (log.match(/마이크: .*/) || [''])[0]);
   await page.click('#btnCloseSheet');
   await page.click('#btnMic');
-  check('[통화] 빨간 버튼 누르면 통화 끝', (await page.textContent('#pillText')) === '동시통역' && await page.isDisabled('#btnMute') && /통화 끝/.test(await page.textContent('#statusText')), await page.textContent('#statusText'));
+  check('[통화] 빨간 버튼 누르면 통화 끝', !(await page.isVisible('#btnMic.on')) && await page.isDisabled('#btnMute') && /통화 끝/.test(await page.textContent('#statusText')), await page.textContent('#statusText'));
   check('[문장] 페이지 오류 없음', errors.length === 0, errors.join(' | '));
   process.stdout.write(`\n--- 문장 모드 로그 ---\n${log}\n`);
   await ctx.close();
@@ -356,7 +358,7 @@ function liveMock(o = {}) {
   check('[목소리] 남자가 한국어로 말하면 →중국어 세션을 남자 목소리로, 여자가 중국어로 말하면 →한국어 세션을 여자 목소리로 다시 엶', later.join() === 'zh-CN:Charon,ko-KR:Kore', later.join());
   check('[목소리] 번역 소리: 한국어→중국어 남자, 중국어→한국어 여자, OK→중국어 남자 (기본 목소리 소리는 안 나감)', JSON.stringify(st.vals) === '[0.1,0.2,0.1]', JSON.stringify(st.vals));
   check('[목소리] 쪽마다 성별 기억 (다음 통화부터 바로 맞는 목소리)', saved?.left === 'male' && saved?.right === 'female', JSON.stringify(saved));
-  check('[목소리] 카드에 성별 표시', /♂/.test(turns[0]?.meta || '') && /♀/.test(turns[1]?.meta || ''), turns.map((t) => t.meta).join(' / '));
+  check('[목소리] 번역 목소리 성별은 로그에 (카드엔 안 보임)', /ko→zh .*목소리 남/.test(log) && /zh→ko .*목소리 여/.test(log) && turns.every((t) => !/[♂♀]|첫 소리/.test(t.meta)), turns.map((t) => t.meta).join(' / '));
   check('[분류] 글자로 애매한 "OK" 는 목소리로 내 말 판정 → 왼쪽 카드 하나만', turns.length === 3 && turns[2].cls.includes('left') && turns[2].dst === '好的' && /화자 판정: "OK" 은 내 목소리/.test(log), `${JSON.stringify(turns[2])} | ${(log.match(/화자 판정.*/) || ['판정 기록 없음'])[0]}`);
   check('[실시간] 마이크 소리를 두 세션에 모두 보냄', counts['zh-CN'] >= 90 && counts['ko-KR'] >= 90, JSON.stringify(counts));
   check('[통화] 음소거 중엔 안 보내고, 풀면 다시 보냄', mutedGrowth <= 1 && resumed >= 5, `음소거 중 +${mutedGrowth}, 해제 후 +${resumed}`);

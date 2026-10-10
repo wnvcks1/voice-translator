@@ -8,7 +8,7 @@ import { Speaker, loadVoices } from './tts.js';
 import { LiveSession, PcmPlayer, scriptLang, SCRIPT_OF, EchoGuard } from './live.js';
 import { voiceFeatures, VoiceProfiles } from './voice.js';
 
-const VERSION = 'v0.6';
+const VERSION = 'v0.7';
 const $ = (id) => document.getElementById(id);
 const SKEY = 'dt-settings';
 
@@ -265,16 +265,14 @@ async function handleUtterance(u) {
 
     const f0 = u.gender.f0 ? `${Math.round(u.gender.f0)}Hz` : '피치?';
     card.meta.innerHTML = '';
-    const info = document.createElement('span');
     const vtxt = guess.side ? ` · 목소리 ${guess.side === 'left' ? '나' : '상대'} ${Math.round(guess.conf * 100)}%` : '';
-    info.textContent = `${gender === 'male' ? '♂' : '♀'} ${f0} · 분류 ${why}${vtxt} · 첫글자 ${(firstText / 1000).toFixed(1)}s · 완료 ${(r.ms / 1000).toFixed(1)}s · ${shortModel(model)}`;
     const play = document.createElement('button');
     play.textContent = '🔊 다시';
     play.onclick = () => { echo.add(turn.dst, turn.toLang); speaker.say(turn.dst, LANGS[turn.toLang].bcp, turn.gender); };
     const big = document.createElement('button');
     big.textContent = '🔍 크게';
     big.onclick = () => openShow(turn);
-    card.meta.append(info, play, big);
+    card.meta.append(play, big);
     card.el.scrollIntoView({ block: 'end' });
 
     log(`#${id} ${r.lang}→${toLang} ${Math.round(u.durationMs)}ms음성 ${model} | 첫글자 ${Math.round(firstText)}ms 완료 ${Math.round(r.ms)}ms | 분류 ${why}${vtxt} | 피치 ${pitchG}(${f0}) 쪽평균 ${sideF0 ? Math.round(sideF0) : '-'}Hz AI ${aiG} → ${gender}`);
@@ -299,12 +297,9 @@ async function handleUtterance(u) {
 
 /* ---------- 마이크 ---------- */
 /** 듣기 정지 (두 모드 공통) */
-let callT0 = 0;
-let callTimer = 0;
 let muted = false;
-/** 통화 화면 켜기/끄기: 시간 표시, 가운데 버튼을 빨간 끊기 버튼으로, 음소거 버튼 활성 */
+/** 통화 화면 켜기/끄기: 가운데 버튼을 빨간 끊기 버튼으로, 음소거 버튼 활성 */
 function callUi(on) {
-  clearInterval(callTimer);
   $('btnMic').classList.toggle('on', on);
   $('btnMic').innerHTML = on ? ICON_HANG : ICON_MIC;
   $('btnMic').setAttribute('aria-label', on ? '통화 끊기' : '통화 시작');
@@ -312,14 +307,6 @@ function callUi(on) {
   muted = false;
   $('btnMute').classList.remove('muted');
   $('btnMute').textContent = '🎙️';
-  if (!on) { $('pillText').textContent = '동시통역'; return; }
-  callT0 = Date.now();
-  const tick = () => {
-    const t = Math.floor((Date.now() - callT0) / 1000);
-    $('pillText').textContent = `통화 중 ${String(Math.floor(t / 60)).padStart(2, '0')}:${String(t % 60).padStart(2, '0')}`;
-  };
-  tick();
-  callTimer = setInterval(tick, 1000);
 }
 /** @param {boolean} m 음소거 (마이크 데이터를 버림, 장치는 유지) */
 function setMuted(m) {
@@ -341,7 +328,6 @@ function stopAll() {
   mic?.stop();
   mic = null;
   speaker.stop();
-  $('liveDot').classList.remove('on');
   releaseWake();
   setStatus('통화 끝 — 다시 누르면 시작', '');
   showLevel(-100, 0, false);
@@ -371,7 +357,6 @@ async function toggleMic() {
     } else await startSentenceMode();
     listening = true;
     callUi(true);
-    $('liveDot').classList.add('on');
     keepAwake();
   } catch (e) {
     live?.stop(); live = null;
@@ -387,7 +372,7 @@ async function startSentenceMode() {
     log,
     onLevel: (db, floor, active) => {
       showLevel(db, floor, active);
-      if (active && speechT0) setStatus(`🎙 듣는 중 ${((performance.now() - speechT0) / 1000).toFixed(1)}s`, bgText());
+      if (active && speechT0) setStatus('🎙 듣는 중…', bgText());
     },
     onSpeechStart: () => { speechT0 = performance.now(); },
     onDiscard: () => { speechT0 = 0; setStatus(idleText(), bgText()); },
@@ -508,7 +493,7 @@ async function startLive() {
           .then((h) => log(`실시간 앱 음성 ${h.engine} ${h.status} [${h.voice}]`));
       }
       const lat = x.gotAudio ? `첫 소리 ${((x.gotAudio - x.t0) / 1000).toFixed(1)}s` : x.ownTts ? '앱 음성' : '소리 없음';
-      x.card.meta.textContent = `실시간 · ${turn.gender === 'male' ? '♂' : '♀'} · ${lat}`;
+      x.card.meta.textContent = '';
       const audio = x.audio.slice();
       if (audio.length || x.ownTts) {
         const again = document.createElement('button');
@@ -908,5 +893,6 @@ $('show').addEventListener('pointerup', () => {
 });
 
 bindSettings();
+$('ver').textContent = VERSION;
 log(`${VERSION} 로드됨 · ${S.liveMode ? '실시간 모드' : '문장 모드'}`);
 if (!S.key) setStatus('처음이면 ⋯ 설정에서 무료 API 키부터', '');

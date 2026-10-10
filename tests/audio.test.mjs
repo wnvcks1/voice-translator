@@ -241,3 +241,25 @@ test('Downsampler: 변환 뒤에도 음높이 판정 유지 (남 110Hz)', () => 
   assert.equal(g.gender, 'male');
   assert.ok(Math.abs(g.f0 - 110) < 3, `f0 ${g.f0}`);
 });
+
+test('estimateGender: 폰 마이크처럼 기본음 약하고 짝수 배음 강한 남자 목소리도 남자 (v0.6 실측 98Hz→198Hz 오류)', () => {
+  const phone = (f0, hs) => {
+    const r = rng(Math.round(f0));
+    let ph = 0;
+    return Float32Array.from({ length: SR * 1.2 }, (_, i) => {
+      ph += (2 * Math.PI * f0 * (1 + 0.03 * Math.sin((2 * Math.PI * 3 * i) / SR)) * (1 + 0.01 * r())) / SR;
+      let s = 0;
+      hs.forEach((h, k) => { s += h * Math.sin((k + 1) * ph + k); });
+      return 0.1 * (0.6 + 0.4 * Math.sin((2 * Math.PI * 4 * i) / SR)) * s + 0.01 * r();
+    });
+  };
+  for (const hs of [[0.05, 1, 0.25, 0.8, 0.15, 0.5, 0.1, 0.3], [0, 1, 0.3, 0.6, 0.2, 0.4]]) {
+    for (const f0 of [98, 110, 130]) {
+      const g = estimateGender(phone(f0, hs), SR);
+      assert.equal(g.gender, 'male', `${f0}Hz ${JSON.stringify(hs)} → ${g.f0}`);
+      assert.ok(Math.abs(g.f0 - f0) / f0 < 0.05, `${f0}Hz → ${g.f0}`);
+    }
+  }
+  // 진짜 여자 목소리는 기본음이 약해도 그대로
+  for (const f0 of [190, 210, 240]) assert.equal(estimateGender(phone(f0, [0.1, 1, 0.3, 0.5, 0.2]), SR).gender, 'female', `${f0}Hz`);
+});
