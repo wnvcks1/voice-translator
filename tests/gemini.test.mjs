@@ -1,0 +1,111 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { parseLines, pickModels, buildPrompt, sseText, toBase64, interpret } from '../gemini.js';
+
+test('parseLines: 완성된 4줄', () => {
+  const p = parseLines('L|zh\nG|female\nS|你好，请问洗手间在哪里？\nT|안녕하세요, 화장실이 어디예요?\n');
+  assert.equal(p.lang, 'zh');
+  assert.equal(p.gender, 'female');
+  assert.equal(p.src, '你好，请问洗手间在哪里？');
+  assert.equal(p.dst, '안녕하세요, 화장실이 어디예요?');
+  assert.ok(p.done.T);
+});
+
+test('parseLines: 스트리밍 중간 — 마지막 줄은 미완료', () => {
+  const p = parseLines('L|ko\nG|male\nS|이거 얼마');
+  assert.equal(p.src, '이거 얼마');
+  assert.equal(p.done.S, false);
+  assert.equal(p.done.G, true);
+  assert.equal(p.dst, undefined);
+});
+
+test('parseLines: 코드블록·전각 구분자·대소문자 변형 허용', () => {
+  const p = parseLines('```\nL｜ZH\nG: Male\nS| 多少钱\nT|얼마예요\n```');
+  assert.equal(p.lang, 'zh');
+  assert.equal(p.gender, 'male');
+  assert.equal(p.src, '多少钱');
+  assert.equal(p.dst, '얼마예요');
+});
+
+test('parseLines: 잡음 응답', () => {
+  const p = parseLines('L|none\nG|unknown\nS|\nT|\n');
+  assert.equal(p.lang, 'none');
+  assert.equal(p.dst, '');
+});
+
+test('pickModels: latest 별칭 우선, TTS 는 pro 제외·최신', () => {
+  const r = pickModels(['gemini-2.5-flash', 'gemini-flash-latest', 'gemini-3.1-flash-tts-preview', 'gemini-3.8-flash-lite-tts', 'gemini-2.5-pro-preview-tts']);
+  assert.equal(r.chat, 'gemini-flash-latest');
+  assert.equal(r.tts, 'gemini-3.8-flash-lite-tts');
+});
+
+test('pickModels: 별칭 없으면 가장 높은 버전 flash', () => {
+  const r = pickModels(['gemini-2.0-flash', 'gemini-2.5-flash', 'gemini-3-flash-preview', 'gemini-2.5-flash-lite']);
+  assert.equal(r.chat, 'gemini-2.5-flash');
+  assert.equal(r.tts, null);
+});
+
+test('pickModels: flash 가 preview 뿐이어도 무언가 고름', () => {
+  assert.equal(pickModels(['gemini-3-flash-preview', 'gemma-3-27b-it']).chat, 'gemini-3-flash-preview');
+  assert.equal(pickModels(['gemma-3-27b-it']).chat, null);
+});
+
+test('buildPrompt: 두 언어 코드와 맥락 포함', () => {
+  const s = buildPrompt('ko', 'zh', [{ lang: 'ko', src: '안녕', dst: '你好' }]);
+  assert.match(s, /"ko"/);
+  assert.match(s, /"zh"/);
+  assert.match(s, /안녕 => 你好/);
+});
+
+test('sseText: data 줄에서 텍스트만, thought 파트 제외', () => {
+  const ev = 'data: {"candidates":[{"content":{"parts":[{"text":"x","thought":true},{"text":"L|ko\\n"}]}}]}';
+  assert.equal(sseText(ev), 'L|ko\n');
+  assert.equal(sseText('data: [garbage'), '');
+});
+
+test('toBase64: 큰 배열도 스택 오버플로 없이', () => {
+  const b = new Uint8Array(300000).fill(65);
+  assert.equal(toBase64(b).length, 400000);
+});
+
+/** SSE 스트림 응답 흉내 */
+function sseResponse(chunks) {
+  const enc = new TextEncoder();
+  const body = new ReadableStream({
+    start(c) {
+      for (const ch of chunks) c.enqueue(enc.encode(`data: ${JSON.stringify({ candidates: [{ content: { parts: [{ text: ch }] } }] })}\r\n\r\n`));
+      c.close();
+    },
+  });
+  return new Response(body, { status: 200 });
+}
+
+test('interpret: 스트리밍 조각을 이어 붙이고 중간 결과 알림', async () => {
+  const calls = [];
+  globalThis.fetch = async (url, init) => { calls.push({ url, body: JSON.parse(init.body) }); return sseResponse(['L|zh\nG|fem', 'ale\nS|你好\nT|안녕', '하세요']); };
+  const partials = [];
+  const r = await interpret({ key: 'k', model: 'm', wav: new Uint8Array(10), a: 'ko', b: 'zh', onPartial: (p) => partials.push(p) });
+  assert.deepEqual([r.lang, r.gender, r.src, r.dst], ['zh', 'female', '你好', '안녕하세요']);
+  assert.ok(partials.length >= 2);
+  assert.match(calls[0].url, /streamGenerateContent\?alt=sse/);
+  assert.equal(calls[0].body.contents[0].parts[0].inlineData.mimeType, 'audio/wav');
+  assert.equal(calls[0].body.generationConfig.thinkingConfig.thinkingBudget, 0);
+});
+
+test('interpret: thinking 설정 거부(400)면 빼고 재시도', async () => {
+  let n = 0;
+  globalThis.fetch = async (url, init) => {
+    n++;
+    const b = JSON.parse(init.body);
+    if (b.generationConfig.thinkingConfig) return new Response(JSON.stringify({ error: { message: 'thinking_budget is not supported' } }), { status: 400 });
+    return sseResponse(['L|ko\nG|male\nS|네\nT|好的\n']);
+  };
+  const r = await interpret({ key: 'k', model: 'm', wav: new Uint8Array(4), a: 'ko', b: 'zh' });
+  assert.equal(n, 2);
+  assert.equal(r.dst, '好的');
+});
+
+test('interpret: 429 는 status 달린 에러', async () => {
+  globalThis.fetch = async () => new Response(JSON.stringify({ error: { message: 'quota' } }), { status: 429 });
+  await assert.rejects(interpret({ key: 'k', model: 'm', wav: new Uint8Array(4), a: 'ko', b: 'zh' }), (e) => e.status === 429);
+});

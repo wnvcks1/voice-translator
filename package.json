@@ -1,0 +1,11 @@
+{
+  "name": "duplex-translator",
+  "private": true,
+  "type": "module",
+  "description": "한국어 ⇄ 중국어 동시통역 웹앱 (정적, 빌드 없음)",
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "e2e": "node tests/e2e.mjs",
+    "serve": "python3 -m http.server 8766 --bind 127.0.0.1"
+  }
+}
