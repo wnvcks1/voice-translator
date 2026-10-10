@@ -134,16 +134,19 @@ export function estimateGender(pcm, sampleRate, opts = {}) {
 /**
  * 에너지 기반 VAD 상태기계. 프레임을 넣으면 이벤트를 돌려줌.
  * 잡음 바닥(noise floor)을 적응 추적해서 시끄러운 식당에서도 기준이 따라감.
- * @param {{frameMs:number, startDb?:number, endDb?:number, startFrames?:number,
+ * 말 끝 판정은 두 기준 중 하나만 맞아도 '조용함': 바닥+endDb 아래, 또는 이번 말의 최고 음량-dropDb 아래.
+ * 두 번째 기준이 없으면 폰 자동 음량(AGC)이 쉬는 틈에 배경 소음을 키울 때 말이 끝나지 않음 (v0.2 실측 "듣는 중" 고정).
+ * @param {{frameMs:number, startDb?:number, endDb?:number, dropDb?:number, startFrames?:number,
  *          silenceMs?:number, maxMs?:number, minSpeechMs?:number, preRollMs?:number}} cfg
  */
 export function createVad(cfg) {
   const frameMs = cfg.frameMs;
   const startDb = cfg.startDb ?? 10;
   const endDb = cfg.endDb ?? 6;
+  const dropDb = cfg.dropDb ?? 15;
   const startFrames = cfg.startFrames ?? 3;
   const silenceFrames = Math.ceil((cfg.silenceMs ?? 700) / frameMs);
-  const maxFrames = Math.ceil((cfg.maxMs ?? 15000) / frameMs);
+  const maxFrames = Math.ceil((cfg.maxMs ?? 12000) / frameMs);
   const minSpeechFrames = Math.ceil((cfg.minSpeechMs ?? 350) / frameMs);
   const preRoll = Math.ceil((cfg.preRollMs ?? 300) / frameMs);
 
@@ -152,11 +155,12 @@ export function createVad(cfg) {
   let seen = 0;
   let inSpeech = false;
   let above = 0, quiet = 0, voiced = 0;
+  let peak = -120, prevDb = -120;
   let pre = [];
   let buf = [];
   let dbs = [];
 
-  const reset = () => { inSpeech = false; above = 0; quiet = 0; voiced = 0; buf = []; dbs = []; };
+  const reset = () => { inSpeech = false; above = 0; quiet = 0; voiced = 0; buf = []; dbs = []; peak = -120; };
 
   return {
     get noiseFloor() { return floor; },
@@ -189,6 +193,7 @@ export function createVad(cfg) {
         above = db > floor + startDb ? above + 1 : 0;
         if (above >= startFrames) {
           inSpeech = true;
+          prevDb = db;
           buf = pre.slice();
           pre = [];
           voiced = above; quiet = 0;
@@ -198,7 +203,11 @@ export function createVad(cfg) {
       }
       buf.push(frame);
       dbs.push(db);
-      if (db > floor + endDb) { quiet = 0; voiced++; } else quiet++;
+      // 순간 튀는 소리 하나로 최고치가 올라가지 않게 연속 두 프레임 중 낮은 값으로 최고 음량 갱신
+      peak = Math.max(peak, Math.min(db, prevDb));
+      prevDb = db;
+      const loud = db > floor + endDb && db > peak - dropDb;
+      if (loud) { quiet = 0; voiced++; } else quiet++;
       if (quiet >= silenceFrames || buf.length >= maxFrames) {
         const frames = buf;
         const ok = voiced >= minSpeechFrames;
@@ -208,6 +217,11 @@ export function createVad(cfg) {
           const mean = dbs.reduce((x, y) => x + y, 0) / dbs.length;
           const sd = Math.sqrt(dbs.reduce((x, y) => x + (y - mean) ** 2, 0) / dbs.length);
           if (sd < 3) floor = Math.max(floor, mean - 1);
+        } else {
+          // 말 끝 직후의 조용한 구간 = 지금의 배경 소음. AGC 로 커졌으면 바닥도 따라 올림 (작아지면 위에서 빠르게 내려감)
+          const tail = dbs.slice(-silenceFrames);
+          const tailMean = tail.reduce((x, y) => x + y, 0) / tail.length;
+          floor = Math.max(floor, tailMean - 2);
         }
         reset();
         return { type: ok ? 'end' : 'discard', frames, db };

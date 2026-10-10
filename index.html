@@ -134,7 +134,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:10p
   </button>
   <button class="ctrl" id="btnShow" aria-label="상대에게 크게 보여주기" disabled>🔍</button>
 </div>
-<div class="foot">내용은 AI 가 생성함 · Gemini · v0.2</div>
+<div class="foot">내용은 AI 가 생성함 · Gemini · v0.3</div>
 
 <div id="show">
   <div class="big" id="showBig"></div>
@@ -159,7 +159,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:10p
       </div>
     </div>
 
-    <div class="toggle"><span>실시간 모드 (베타)<br><small class="note">말하는 도중에 번역 음성이 나옴 · Gemini Live Translate · 끄면 문장 모드(말이 끝나면 번역)</small></span><input type="checkbox" id="liveMode"></div>
+    <div class="toggle"><span>실시간 모드 (기본)<br><small class="note">전화처럼 계속 들으면서 말하는 도중에 번역 · Gemini Live Translate · 끄면 문장 모드(한마디 끝날 때마다 번역, 역시 계속 들음)</small></span><input type="checkbox" id="liveMode"></div>
     <div class="field" style="margin-top:10px">
       <label>실시간 번역 모델</label>
       <select id="liveModel"></select>
@@ -189,7 +189,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:10p
       <select id="ttsModel"></select>
     </div>
 
-    <div class="toggle"><span>이어폰 모드<br><small class="note">재생 중에도 계속 들음 (스피커면 자기 목소리를 다시 번역하므로 끄기)</small></span><input type="checkbox" id="earphone"></div>
+    <div class="toggle"><span>에코 막기<br><small class="note">번역 음성이 나오는 동안 듣기를 멈춤. 기본은 꺼짐(전화처럼 계속 들음). 스피커 소리를 자꾸 다시 번역하면 켜기</small></span><input type="checkbox" id="echoBlock"></div>
 
     <div class="field" style="margin-top:12px">
       <label>재생 속도 <span id="rateVal"></span></label>
@@ -207,8 +207,8 @@ header{display:flex;align-items:center;justify-content:space-between;padding:10p
 
     <div class="field">
       <label>소리 확인</label>
-      <button class="btn" id="btnSound">🔊 소리 테스트 (한국어 → 상대 언어)</button>
-      <div class="note">안 들리면: 폰 미디어 볼륨 확인 → 삼성 설정 › 일반 › 텍스트 음성 변환 › 기본 엔진을 Google 로, 중국어 음성 데이터 설치</div>
+      <button class="btn" id="btnSound">🔊 소리 테스트 (삐 → 폰 음성 → AI 음성)</button>
+      <div class="note">삐 소리도 안 들리면 폰 미디어 볼륨(음량 버튼 → 미디어) 문제. 삐만 들리면 폰 음성 엔진 문제 → 삼성 설정 › 일반 › 텍스트 음성 변환 › 기본 엔진 Google. 카톡·Claude 앱 안의 브라우저 말고 Chrome 으로 직접 열기 권장</div>
     </div>
 
     <div class="field">

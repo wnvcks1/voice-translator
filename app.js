@@ -5,17 +5,17 @@
 import { startMic } from './audio.js';
 import { interpret, listModels, pickModels, LANGS, AI_VOICES } from './gemini.js';
 import { Speaker, loadVoices } from './tts.js';
-import { LiveSession, PcmPlayer, scriptLang, SCRIPT_OF } from './live.js';
+import { LiveSession, PcmPlayer, scriptLang, SCRIPT_OF, EchoGuard } from './live.js';
 
-const VERSION = 'v0.2';
+const VERSION = 'v0.3';
 const $ = (id) => document.getElementById(id);
 const SKEY = 'dt-settings';
 
 const DEFAULTS = {
   key: '', chatModel: '', chatList: [], ttsModel: '', liveModel: '', models: [], bidiModels: [],
   them: 'zh', aiVoice: false, aiVoiceMale: 'Charon', aiVoiceFemale: 'Kore',
-  earphone: false, rate: 1, silenceMs: 700, maleMax: 160, femaleMin: 180,
-  liveMode: false, meGender: 'auto', themGender: 'auto',
+  echoBlock: false, rate: 1, silenceMs: 700, maleMax: 160, femaleMin: 180,
+  liveMode: true, meGender: 'auto', themGender: 'auto', ver: 3,
 };
 
 /** @returns {object} 저장된 설정 */
@@ -23,6 +23,12 @@ function loadSettings() {
   try { return { ...DEFAULTS, ...JSON.parse(localStorage.getItem(SKEY) || '{}') }; } catch { return { ...DEFAULTS }; }
 }
 const S = loadSettings();
+// v0.3: 전화처럼 계속 듣는 실시간 모드를 기본으로 (이전 버전에서 꺼 둔 값도 한 번 켬)
+if ((S.ver || 0) < 3) {
+  S.liveMode = true;
+  S.ver = 3;
+  try { localStorage.setItem(SKEY, JSON.stringify(S)); } catch { /* 사생활 모드 */ }
+}
 // v0.1 에서 저장된 설정(Flash 하나만)은 일일 한도가 금방 참 → 저장된 모델 목록으로 Flash-Lite 우선 순서를 다시 만듦
 if (!S.chatList.length && S.models.length) {
   const p = pickModels(S.models, S.bidiModels);
@@ -57,21 +63,21 @@ const lastGender = {}; // 언어별 직전 성별: 피치 판정 보류 시 사�
 const exhausted = new Map(); // 모델 → 다시 써볼 시각 (무료 한도 초과 시)
 let seq = 0;
 let live = null; // 실시간 모드 상태
+const echo = new EchoGuard(20000); // 스피커로 내보낸 번역이 다시 들려 또 번역되는 것 방지
+let inflight = 0; // 백그라운드에서 번역 중인 문장 수
+let speechT0 = 0;
 
-const idleText = () => (listening ? '듣는 중… 말해 보세요' : '정지됨');
+const idleText = () => (listening ? '듣는 중… 그냥 말하면 됨' : '정지됨');
+/** 아래 작은 줄: 백그라운드 번역 진행 상황 */
+const bgText = () => (inflight ? `번역 ${inflight}건 처리 중 (계속 듣는 중)` : '');
 
 const speaker = new Speaker({
   getSettings: () => S,
-  // 재생 전 마이크를 완전히 놓음 (Android 통화 모드 해제 → 스피커로 정상 출력, 자기 목소리 재번역도 방지)
-  onBusy: async (busy) => {
-    if (!mic || S.earphone) return;
-    if (busy) {
-      mic.release();
-      setStatus('🔊 재생 중');
-    } else if (listening) {
-      try { await mic.reacquire(); } catch (e) { log(`마이크 다시 켜기 실패 ${e.message}`); }
-      setStatus(idleText());
-    }
+  // 기본은 재생 중에도 계속 들음(전화처럼). 되돌이 번역은 EchoGuard 가 글자 비교로 거름.
+  // '에코 막기'를 켜면 재생하는 동안만 듣기를 멈춤 (스피커가 크고 폰 에코 제거가 약할 때)
+  onBusy: (busy) => {
+    if (!mic || live || !S.echoBlock) return;
+    if (busy) mic.pause(); else mic.resume();
   },
   onError: (m) => log(m),
 });
@@ -164,7 +170,8 @@ async function handleUtterance(u) {
   const a = 'ko', b = S.them;
   const t0 = performance.now();
   let firstText = 0;
-  setStatus('번역 중…', `${(u.durationMs / 1000).toFixed(1)}초 분량 전송`);
+  inflight++;
+  setStatus(idleText(), bgText());
 
   try {
     const onPartial = (p) => {
@@ -198,7 +205,11 @@ async function handleUtterance(u) {
     if (r.lang !== a && r.lang !== b || !r.dst) {
       card.el.remove();
       log(`#${id} 무시 (lang=${r.lang}, ${Math.round(r.ms)}ms) raw=${JSON.stringify(r.raw).slice(0, 120)}`);
-      setStatus(idleText(), '잡음으로 판단해 건너뜀');
+      return;
+    }
+    if (echo.isEcho(r.src, r.lang)) {
+      card.el.remove();
+      log(`#${id} 에코 무시: 방금 스피커로 나간 말 "${r.src.slice(0, 20)}"`);
       return;
     }
 
@@ -230,18 +241,18 @@ async function handleUtterance(u) {
     info.textContent = `${gender === 'male' ? '♂' : '♀'} ${f0} · 첫글자 ${(firstText / 1000).toFixed(1)}s · 완료 ${(r.ms / 1000).toFixed(1)}s · ${shortModel(model)}`;
     const play = document.createElement('button');
     play.textContent = '🔊 다시';
-    play.onclick = () => speaker.say(turn.dst, LANGS[turn.toLang].bcp, turn.gender);
+    play.onclick = () => { echo.add(turn.dst, turn.toLang); speaker.say(turn.dst, LANGS[turn.toLang].bcp, turn.gender); };
     const big = document.createElement('button');
     big.textContent = '🔍 크게';
     big.onclick = () => openShow(turn);
     card.meta.append(info, play, big);
     card.el.scrollIntoView({ block: 'end' });
-    setStatus(idleText(), '');
 
     log(`#${id} ${r.lang}→${toLang} ${Math.round(u.durationMs)}ms음성 ${model} | 첫글자 ${Math.round(firstText)}ms 완료 ${Math.round(r.ms)}ms | 피치 ${pitchG}(${f0}) AI ${aiG} → ${gender}`);
 
     // 재생 실패가 번역 결과를 오류로 덮지 않게 따로 처리
     const tts0 = performance.now();
+    echo.add(r.dst, toLang);
     speaker.say(r.dst, LANGS[toLang].bcp, gender)
       .then((how) => log(`#${id} 재생 ${how.engine} ${how.status} [${how.voice}] ${Math.round(performance.now() - tts0)}ms`))
       .catch((e) => log(`#${id} 재생 실패 ${e.message}`));
@@ -251,7 +262,9 @@ async function handleUtterance(u) {
     const msg = e.status === 429 ? '모든 모델 무료 한도 초과. 1분 뒤 다시 (일일 한도면 내일 오후 4시 초기화)' : e.message;
     card.dst.textContent = `오류: ${msg}`;
     log(`#${id} 오류 ${e.message}`);
-    setStatus(idleText(), '오류 발생 — 로그 확인');
+  } finally {
+    inflight--;
+    setStatus(idleText(), bgText());
   }
 }
 
@@ -281,8 +294,18 @@ async function toggleMic() {
   // 터치 안에서 재생 장치를 깨워 둠 (Android 는 터치 밖에서 처음 재생하면 막음)
   speaker.unlock();
   try {
-    if (S.liveMode) await startLive();
-    else await startSentenceMode();
+    if (S.liveMode) {
+      try {
+        await startLive();
+      } catch (e) {
+        // 실시간 모델이 없거나 연결 실패 → 듣기는 멈추지 않게 문장 모드로 바로 전환
+        live?.stop(); live = null;
+        mic?.stop(); mic = null;
+        log(`실시간 모드 실패 → 문장 모드로 전환: ${e.message}`);
+        await startSentenceMode();
+        setStatus(idleText(), '실시간 연결 실패 — 문장 모드로 듣는 중');
+      }
+    } else await startSentenceMode();
     listening = true;
     $('btnMic').classList.add('on');
     $('liveDot').classList.add('on');
@@ -298,15 +321,20 @@ async function toggleMic() {
 async function startSentenceMode() {
   mic = await startMic({
     vad: { silenceMs: S.silenceMs },
-    onLevel: showLevel,
-    onSpeechStart: () => setStatus('🎙 듣는 중…', ''),
-    onDiscard: () => setStatus(idleText(), '너무 짧아서 건너뜀'),
+    onLevel: (db, floor, active) => {
+      showLevel(db, floor, active);
+      if (active && speechT0) setStatus(`🎙 듣는 중 ${((performance.now() - speechT0) / 1000).toFixed(1)}s`, bgText());
+    },
+    onSpeechStart: () => { speechT0 = performance.now(); },
+    onDiscard: () => { speechT0 = 0; setStatus(idleText(), bgText()); },
     onUtterance: (u) => {
+      speechT0 = 0;
       u.gender = reGender(u.gender);
       handleUtterance(u);
+      setStatus(idleText(), bgText());
     },
   });
-  setStatus('듣는 중… 말해 보세요', `문장 모드 · ${LANGS.ko.native} ⇄ ${LANGS[S.them].native}`);
+  setStatus(idleText(), `문장 모드 · ${LANGS.ko.native} ⇄ ${LANGS[S.them].native}`);
   log(`문장 모드 시작 ${mic.ctx.sampleRate}Hz, 번역 ${modelQueue().join(' > ')}${S.aiVoice ? ` / TTS ${S.ttsModel}` : ''}`);
 }
 
@@ -323,7 +351,13 @@ async function startLive() {
   const player = new PcmPlayer(() => speaker.audioCtx());
   const them = S.them;
   // 세션별 상태: →상대언어 세션은 한국어 말을 받아 왼쪽 카드, →한국어 세션은 상대 말을 받아 오른쪽 카드
-  const mk = (target, side, from, to, gender) => ({ target, side, from, to, gender, inText: '', outText: '', card: null, mute: false, lastAt: 0, t0: 0, gotAudio: 0 });
+  const blank = { inText: '', outText: '', card: null, mute: false, checked: false, held: [], holdTimer: 0, lastAt: 0, t0: 0, gotAudio: 0 };
+  const mk = (target, side, from, to, gender) => ({ target, side, from, to, gender, ...blank, held: [] });
+  const flush = (x) => {
+    clearTimeout(x.holdTimer);
+    for (const [f, r] of x.held) player.push(f, r);
+    x.held = [];
+  };
   const st = {
     out: mk(LANGS[them].bcp, 'left', 'ko', them, S.meGender),
     ko: mk('ko-KR', 'right', them, 'ko', S.themGender),
@@ -343,7 +377,9 @@ async function startLive() {
       x.card.meta.append(' ', big);
       log(`실시간 ${x.from}→${x.to} | ${lat} | "${turn.src.slice(0, 30)}" → "${turn.dst.slice(0, 30)}"`);
     } else if (x.card) x.card.el.remove();
-    Object.assign(x, { inText: '', outText: '', card: null, mute: false, lastAt: 0, t0: 0, gotAudio: 0 });
+    if (!x.mute) flush(x);
+    clearTimeout(x.holdTimer);
+    Object.assign(x, { ...blank, held: [] });
   };
   const ensureCard = (x) => {
     if (!x.card) {
@@ -359,23 +395,36 @@ async function startLive() {
       x.inText += t;
       // 이미 목표 언어인 말(예: →한국어 세션이 한국어를 들음)은 이 세션 몫이 아님 → 소리·글 무시
       const lang = scriptLang(x.inText);
-      if (lang && lang === SCRIPT_OF[x.to]) { x.mute = true; x.card?.el.remove(); x.card = null; return; }
+      const drop = (why) => {
+        if (!x.mute && why) log(why);
+        x.mute = true; x.held = []; clearTimeout(x.holdTimer);
+        x.card?.el.remove(); x.card = null;
+      };
+      if (lang && lang === SCRIPT_OF[x.to]) return drop('');
+      // 스피커로 나간 번역이 다시 들린 것 → 또 번역하면 무한 반복
+      if (echo.isEcho(x.inText, x.from)) return drop(`실시간 에코 무시 "${x.inText.slice(0, 20)}"`);
       if (lang && lang === SCRIPT_OF[x.from]) x.mute = false;
       if (x.mute) return;
       ensureCard(x).src.textContent = x.inText;
       x.card.el.scrollIntoView({ block: 'end' });
+      // 에코가 아님이 확인될 만큼 글자가 모이면 보류해 둔 번역 소리를 내보냄
+      if (!x.checked && x.inText.replace(/[\s\p{P}]/gu, '').length >= 4) { x.checked = true; flush(x); }
     },
     onOut: (t) => {
       if (x.mute) return;
       x.outText += t;
+      echo.add(x.outText, x.to);
       ensureCard(x).dst.textContent = x.outText;
       x.card.el.scrollIntoView({ block: 'end' });
     },
     onAudio: (f, rate) => {
       if (x.mute) return;
-      if (!x.gotAudio) x.gotAudio = performance.now();
       ensureCard(x);
-      player.push(f, rate);
+      if (!x.gotAudio) x.gotAudio = performance.now();
+      if (x.checked) { player.push(f, rate); return; }
+      // 들은 말 글자가 아직 없으면 에코인지 모름 → 최대 1.2초 보류 후 재생
+      x.held.push([f, rate]);
+      if (!x.holdTimer) x.holdTimer = setTimeout(() => { if (!x.mute) { x.checked = true; flush(x); } }, 1200);
     },
     onTurnEnd: () => finish(x),
   });
@@ -417,25 +466,51 @@ async function startLive() {
     vad: { silenceMs: S.silenceMs },
     onLevel: showLevel,
     onFrame: (f) => {
-      // 스피커 재생 중엔 자기 번역 음성을 다시 번역하지 않게 무음을 보냄 (이어폰 모드는 계속 들음)
-      const gate = !S.earphone && player.playing;
-      if (gate !== gated) { gated = gate; setStatus(gate ? '🔊 번역 음성 재생 중' : '듣는 중… 말하는 동안 번역됨'); }
+      // 기본은 전화처럼 재생 중에도 계속 들음. '에코 막기'를 켜면 재생 동안 무음을 보냄
+      const gate = S.echoBlock && player.playing;
+      if (gate !== gated) { gated = gate; setStatus(gate ? '🔊 번역 음성 재생 중' : '듣는 중… 그냥 말하면 바로 번역됨'); }
       const out = gate ? new Float32Array(f.length) : f;
       for (const s of sessions) s.send(out);
     },
   });
-  setStatus('듣는 중… 말하는 동안 번역됨', `실시간 모드(베타) · ${shortModel(S.liveModel)}`);
+  setStatus('듣는 중… 그냥 말하면 바로 번역됨', `실시간 모드 · ${shortModel(S.liveModel)}`);
   log(`실시간 모드 시작: ${S.liveModel}, 세션 2개 (→${LANGS[them].bcp}, →ko-KR)`);
 }
 
-/** 소리 테스트: 마이크 끈 상태에서 한국어·상대 언어를 차례로 읽어 결과를 로그에 남김 */
+/**
+ * 소리 테스트 3단계: ① 삐 소리(앱 오디오 경로) ② 폰 음성 ③ AI 음성. 어느 단계가 들렸는지로 원인을 가름.
+ * 지금 마이크 상태(켜짐/꺼짐) 그대로 테스트 → 둘 다 해보면 마이크가 소리를 막는지도 알 수 있음.
+ */
 async function testSound() {
   speaker.unlock();
-  const samples = { ko: '안녕하세요. 소리 테스트입니다.', zh: '你好，这是声音测试。', en: 'Hello, this is a sound test.', ja: 'こんにちは、音声テストです。', es: 'Hola, esto es una prueba de sonido.' };
-  for (const [lang, g] of [['ko', 'male'], [S.them, 'female']]) {
-    const r = await speaker.say(samples[lang], LANGS[lang].bcp, g);
-    log(`소리 테스트 ${lang}/${g}: ${r.engine} ${r.status} [${r.voice}]`);
-  }
+  const micState = listening ? '마이크 켜짐' : '마이크 꺼짐';
+  const ctx = speaker.audioCtx();
+  if (ctx.state === 'suspended') await ctx.resume().catch(() => {});
+  setStatus('🔊 1/3 삐 소리', micState);
+  const osc = ctx.createOscillator();
+  const g = ctx.createGain();
+  g.gain.value = 0.25;
+  osc.frequency.value = 660;
+  osc.connect(g).connect(ctx.destination);
+  osc.start();
+  osc.stop(ctx.currentTime + 0.6);
+  await new Promise((r) => setTimeout(r, 900));
+  log(`소리 테스트 1/3 삐: AudioContext ${ctx.state} ${ctx.sampleRate}Hz (${micState})`);
+
+  setStatus('🔊 2/3 폰 음성', micState);
+  const p = await speaker.sayLocal('하나, 둘, 셋. 폰 음성 테스트입니다.', 'ko-KR', 'male', S);
+  log(`소리 테스트 2/3 폰 음성: ${p.status} [${p.voice}] (${micState})`);
+
+  if (S.key && S.ttsModel) {
+    setStatus('🔊 3/3 AI 음성', micState);
+    try {
+      const r = await speaker.sayAi('하나, 둘, 셋. AI 음성 테스트입니다.', 'male', S);
+      log(`소리 테스트 3/3 AI 음성: ${r.status} [${r.voice}] (${micState})`);
+    } catch (e) {
+      log(`소리 테스트 3/3 AI 음성 실패: ${e.message}`);
+    }
+  } else log('소리 테스트 3/3 건너뜀: 연결 확인 먼저');
+  setStatus(listening ? idleText() : '소리 테스트 끝', '삐 / 폰 음성 / AI 음성 중 들린 것만 알려 주세요');
 }
 
 /**
@@ -543,7 +618,7 @@ function bindSettings() {
   $('meGender').onchange = (e) => { S.meGender = e.target.value; save(); };
   $('themGender').onchange = (e) => { S.themGender = e.target.value; save(); };
   $('btnSound').onclick = testSound;
-  $('earphone').checked = S.earphone;
+  $('echoBlock').checked = S.echoBlock;
   $('rate').value = S.rate; $('rateVal').textContent = `${S.rate}x`;
   $('silence').value = S.silenceMs; $('silVal').textContent = `${S.silenceMs}ms`;
   $('maleMax').value = S.maleMax; $('mVal').textContent = S.maleMax;
@@ -555,7 +630,7 @@ function bindSettings() {
   $('chatModel').onchange = (e) => { S.chatModel = e.target.value; save(); };
   $('ttsModel').onchange = (e) => { S.ttsModel = e.target.value; save(); };
   $('aiVoice').onchange = (e) => { S.aiVoice = e.target.checked; save(); };
-  $('earphone').onchange = (e) => { S.earphone = e.target.checked; save(); };
+  $('echoBlock').onchange = (e) => { S.echoBlock = e.target.checked; save(); };
   $('rate').oninput = (e) => { S.rate = Number(e.target.value); $('rateVal').textContent = `${S.rate}x`; save(); };
   $('silence').oninput = (e) => { S.silenceMs = Number(e.target.value); $('silVal').textContent = `${S.silenceMs}ms`; save(); };
   $('silence').onchange = () => { if (listening) log('침묵 길이는 마이크 다시 켜면 적용'); };
@@ -575,7 +650,11 @@ function bindSettings() {
 
 /* ---------- 버튼 ---------- */
 $('btnMic').onclick = toggleMic;
-$('btnReplay').onclick = () => lastTurn && speaker.say(lastTurn.dst, LANGS[lastTurn.toLang].bcp, lastTurn.gender);
+$('btnReplay').onclick = () => {
+  if (!lastTurn) return;
+  echo.add(lastTurn.dst, lastTurn.toLang);
+  speaker.say(lastTurn.dst, LANGS[lastTurn.toLang].bcp, lastTurn.gender);
+};
 $('btnShow').onclick = () => lastTurn && openShow(lastTurn);
 $('btnClear').onclick = () => {
   $('feed').innerHTML = '';

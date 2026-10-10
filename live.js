@@ -26,6 +26,61 @@ export function scriptLang(text) {
   return best[1] > 0 ? best[0] : null;
 }
 
+/**
+ * 글자 2개씩 묶은 집합 (공백·문장부호 제외). 한글·한자는 글자 하나가 정보가 커서 2-gram 이면 충분.
+ * @param {string} text
+ * @returns {Set<string>}
+ */
+export function bigrams(text) {
+  const t = text.toLowerCase().replace(/[\s\p{P}\p{S}]/gu, '');
+  const out = new Set();
+  if (t.length === 1) out.add(t);
+  for (let i = 0; i + 1 < t.length; i++) out.add(t.slice(i, i + 2));
+  return out;
+}
+
+/**
+ * 스피커로 나간 번역 음성이 마이크로 다시 들어와 또 번역되는 것(에코)을 글자 비교로 잡음.
+ * 전화처럼 계속 듣는 모드에선 폰 에코 제거가 놓친 소리가 '되돌이 번역'을 무한 반복시킬 수 있음.
+ */
+export class EchoGuard {
+  /** @param {number} [windowMs] 최근 몇 초 안에 내보낸 말과 비교할지 */
+  constructor(windowMs = 20000) {
+    this.windowMs = windowMs;
+    this.items = [];
+  }
+
+  /**
+   * 내보낸(재생한) 말 기록.
+   * @param {string} text
+   * @param {string} lang
+   * @param {number} [now]
+   */
+  add(text, lang, now = Date.now()) {
+    if (text) this.items.push({ g: bigrams(text), lang, at: now });
+    this.items = this.items.filter((x) => now - x.at < this.windowMs);
+  }
+
+  /**
+   * 들은 말이 최근 내보낸 말의 되울림인지. 들은 말의 2-gram 중 60% 이상이 내보낸 말에 있으면 에코.
+   * @param {string} text 들은 말 (부분이어도 됨)
+   * @param {string} lang 들은 말의 언어
+   * @param {number} [now]
+   * @returns {boolean}
+   */
+  isEcho(text, lang, now = Date.now()) {
+    const g = bigrams(text);
+    if (g.size < 3) return false;
+    for (const x of this.items) {
+      if (x.lang !== lang || now - x.at >= this.windowMs) continue;
+      let hit = 0;
+      for (const b of g) if (x.g.has(b)) hit++;
+      if (hit / g.size >= 0.6) return true;
+    }
+    return false;
+  }
+}
+
 /** 언어 코드 → 글자 종류 */
 export const SCRIPT_OF = { ko: 'ko', zh: 'zh', ja: 'ja', en: 'latin', es: 'latin' };
 

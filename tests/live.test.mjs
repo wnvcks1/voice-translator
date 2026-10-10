@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { scriptLang, floatToPcm16, pcm16ToFloat, buildSetup, LiveSession, SETUP_VARIANTS } from '../live.js';
+import { scriptLang, floatToPcm16, pcm16ToFloat, buildSetup, LiveSession, SETUP_VARIANTS, EchoGuard, bigrams } from '../live.js';
 import { toBase64 } from '../gemini.js';
 
 test('scriptLang: 한글/한자/가나/라틴 판별', () => {
@@ -97,4 +97,19 @@ test('LiveSession: 서버 메시지 → 전사·번역·소리·턴 종료 콜�
   assert.equal(audioMsgs.length, 1, '683*3=2049 ≥ 1600 에서 한 번 전송');
   assert.equal(audioMsgs[0].realtimeInput.audio.mimeType, 'audio/pcm;rate=16000');
   assert.equal(atob(audioMsgs[0].realtimeInput.audio.data).length, 683 * 3 * 2);
+});
+
+test('EchoGuard: 내보낸 중국어가 다시 들리면 에코, 다른 말은 통과', () => {
+  const g = new EchoGuard(20000);
+  g.add('这个多少钱？', 'zh', 1000);
+  assert.equal(g.isEcho('这个多少', 'zh', 3000), true, '부분 전사도 에코로');
+  assert.equal(g.isEcho('这个多少钱', 'zh', 3000), true);
+  assert.equal(g.isEcho('我想要两张票', 'zh', 3000), false, '상대의 새 말');
+  assert.equal(g.isEcho('这个多少钱', 'ko', 3000), false, '언어가 다르면 비교 안 함');
+  assert.equal(g.isEcho('这个多少钱', 'zh', 30000), false, '20초 지나면 잊음');
+  assert.equal(g.isEcho('这个', 'zh', 3000), false, '너무 짧으면 판단 보류');
+});
+
+test('bigrams: 공백·문장부호 무시', () => {
+  assert.deepEqual([...bigrams('이건, 30위안!')], ['이건', '건3', '30', '0위', '위안']);
 });

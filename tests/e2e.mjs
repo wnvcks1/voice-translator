@@ -53,7 +53,7 @@ async function newPage(o = {}) {
       if (!src) {
         const ac = new AudioContext();
         const SR = ac.sampleRate;
-        const seg = [[1.5, 0], [1.6, 120], [3.0, 0], [1.6, 220], [8, 0]];
+        const seg = [[1.5, 0], [1.6, 120], [3.0, 0], [1.6, 220], [3.0, 0], [1.6, 150], [8, 0]];
         const total = seg.reduce((s, [d]) => s + d, 0);
         const buf = ac.createBuffer(1, Math.round(SR * total), SR);
         const ch = buf.getChannelData(0);
@@ -125,7 +125,9 @@ const MODELS = {
     if (n === 1) return route.fulfill({ status: 429, json: { error: { message: 'Quota exceeded for metric: generate_content_free_tier_requests, limit: 20, model: gemini-flash-lite, GenerateRequestsPerDayPerProjectPerModel-FreeTier' } } });
     const text = n === 2
       ? 'L|ko\nG|female\nS|이거 얼마예요?\nT|这个多少钱？\n'
-      : 'L|zh\nG|female\nS|这个三十块。\nT|이건 30위안이에요.\n';
+      : n === 3
+        ? 'L|zh\nG|female\nS|这个三十块。\nT|이건 30위안이에요.\n'
+        : 'L|zh\nG|male\nS|这个多少钱？\nT|이거 얼마예요?\n';
     const sse = text.match(/[\s\S]{1,9}/g).map((c) => `data: ${JSON.stringify({ candidates: [{ content: { parts: [{ text: c }] } }] })}\r\n\r\n`).join('');
     await new Promise((r) => setTimeout(r, 150));
     return route.fulfill({ status: 200, headers: { 'Content-Type': 'text/event-stream' }, body: sse });
@@ -138,6 +140,8 @@ const MODELS = {
   await page.fill('#key', 'AIza-test');
   await page.click('#btnTest');
   await page.waitForSelector('#keyStatus .ok', { timeout: 5000 });
+  check('[문장] 실시간 모드가 기본으로 켜져 있음', await page.isChecked('#liveMode'));
+  await page.uncheck('#liveMode');
   check('[문장] Flash-Lite 우선 선택', (await page.inputValue('#chatModel')) === 'gemini-flash-lite-latest', await page.inputValue('#chatModel'));
   check('[문장] 실시간 모델 자동 선택', (await page.inputValue('#liveModel')) === 'gemini-3.5-live-translate-preview', await page.inputValue('#liveModel'));
   await page.screenshot({ path: join(out, 's1-settings.png') });
@@ -145,8 +149,12 @@ const MODELS = {
 
   await page.click('#btnMic');
   await page.waitForFunction(() => document.querySelectorAll('.turn:not(.pending)').length >= 2, null, { timeout: 30000 }).catch(() => {});
-  await page.waitForTimeout(2500);
+  await page.waitForFunction(() => /에코 무시/.test(document.getElementById('log').textContent), null, { timeout: 15000 }).catch(() => {});
+  await page.waitForTimeout(800);
   await page.screenshot({ path: join(out, 's2-conversation.png') });
+  await page.click('#btnSettings');
+  await page.click('#btnSound');
+  await page.waitForFunction(() => /소리 테스트 3\/3/.test(document.getElementById('log').textContent), null, { timeout: 15000 }).catch(() => {});
 
   const turns = await page.$$eval('.turn', (els) => els.map((e) => ({ cls: e.className, src: e.querySelector('.src').textContent, dst: e.querySelector('.dst').textContent, meta: e.querySelector('.meta').textContent })));
   const spoken = await page.evaluate(() => window.__spoken);
@@ -160,12 +168,14 @@ const MODELS = {
   check('[문장] 중국어 카드는 오른쪽', turns[1]?.cls.includes('right') && turns[1].src === '这个三十块。', JSON.stringify(turns[1]));
   check('[문장] Gemini 가 여자라 해도 피치(120Hz)로 남성', /♂ 1[12]\dHz/.test(turns[0]?.meta || ''), turns[0]?.meta);
   check('[문장] 피치(220Hz)로 여성', /♀ 2[12]\dHz/.test(turns[1]?.meta || ''), turns[1]?.meta);
-  check('[문장] 재생 전에 마이크를 놓음', spoken[0] && spoken[0].stops >= 1, JSON.stringify(spoken[0]));
-  check('[문장] 재생 후 마이크 다시 잡음', st.gum >= 3, `getUserMedia ${st.gum}회`);
-  check('[문장] 마이크 다시 잡은 뒤 문장 길이 정상 (무음 프레임에 소음 기준 안 무너짐)', !/\d{5}ms음성/.test(log) && /#2 zh→ko [12]\d{3}ms음성/.test(log), (log.match(/#2 \S+ \d+ms음성/) || [''])[0]);
+  check('[문장] 전화처럼 재생 중에도 마이크 계속 켜 둠', st.gum === 1 && st.stops === 0, `getUserMedia ${st.gum}회, 끈 횟수 ${st.stops}`);
+  check('[문장] 문장 길이 정상 (말 끝 판정)', !/\d{5}ms음성/.test(log) && /#2 zh→ko [12]\d{3}ms음성/.test(log), (log.match(/#2 \S+ \d+ms음성/) || [''])[0]);
+  check('[문장] 스피커로 나간 중국어가 다시 들리면 에코로 무시 (카드·소리 없음)', /에코 무시/.test(log) && turns.length === 2 && !spoken.some((x) => x.text === '이거 얼마예요?'), `카드 ${turns.length}개`);
+  check('[문장] 소리 테스트 3단계 기록', /1\/3 삐: AudioContext running/.test(log) && /2\/3 폰 음성: ok/.test(log) && /3\/3 AI 음성: ok/.test(log), log.split('\n').filter((l) => /소리 테스트/.test(l)).join(' / '));
   check('[문장] 폰 중국어 음성 실패 → AI 음성 대체 재생', calls.some((c) => c.tts) && st.played >= 1 && /AI 음성으로 대체/.test(log), `tts요청 ${calls.filter((c) => c.tts).length} 재생 ${st.played}`);
   check('[문장] 한국어 번역은 폰 음성·여자 음높이', spoken.some((s) => s.lang === 'ko-KR' && s.pitch >= 1), JSON.stringify(spoken));
   check('[문장] 두 번째 요청에 대화 맥락 포함', /이거 얼마예요\? => 这个多少钱？/.test(chatCalls[2]?.body.contents[0].parts[1].text || ''));
+  check('[문장] 마이크 켠 채 계속 처리 (3번째 발화도 전송)', chatCalls.length === 4, `${chatCalls.length}건`);
   check('[문장] 페이지 오류 없음', errors.length === 0, errors.join(' | '));
   process.stdout.write(`\n--- 문장 모드 로그 ---\n${log}\n`);
   await ctx.close();
@@ -217,11 +227,19 @@ const MODELS = {
         }
         sc({ turnComplete: true });
       }
+      if (n === 40 && target === 'ko-KR') {
+        // 스피커로 나간 '这个多少钱？' 가 마이크로 되들어온 상황 → 앱이 걸러야 함
+        sc({ inputTranscription: { text: '这个多少钱' } });
+        sc({ outputTranscription: { text: '이거 얼마예요' }, modelTurn: { parts: [{ inlineData: { mimeType: 'audio/pcm;rate=24000', data: pcm } }] } });
+        sc({ turnComplete: true });
+      }
       if (n === 60) {
-        sc({ inputTranscription: { text: '这个三十块。' } });
         if (target === 'ko-KR') {
-          sc({ outputTranscription: { text: '이건 30위안이에요.' }, modelTurn: { parts: [{ inlineData: { mimeType: 'audio/pcm;rate=24000', data: pcm } }] } });
+          // 번역 소리가 들은 글자보다 먼저 도착 → 보류했다가 확인 후 재생
+          sc({ modelTurn: { parts: [{ inlineData: { mimeType: 'audio/pcm;rate=24000', data: pcm } }] } });
         }
+        sc({ inputTranscription: { text: '这个三十块。' } });
+        if (target === 'ko-KR') sc({ outputTranscription: { text: '이건 30위안이에요.' } });
         sc({ turnComplete: true });
       }
     });
@@ -249,9 +267,30 @@ const MODELS = {
   check('[실시간] 마이크 소리를 두 세션에 모두 보냄', counts['zh-CN'] >= 60 && counts['ko-KR'] >= 60, JSON.stringify(counts));
   check('[실시간] 한국어 → 왼쪽 카드', turns.length === 2 && turns[0].cls.includes('left') && turns[0].src === '이거 얼마예요?' && turns[0].dst === '这个多少钱？', JSON.stringify(turns));
   check('[실시간] 중국어 → 오른쪽 카드', turns[1]?.cls.includes('right') && turns[1].src === '这个三十块。' && turns[1].dst === '이건 30위안이에요.', JSON.stringify(turns[1]));
-  check('[실시간] 번역 음성 2번만 재생 (같은 언어 되풀이 소리는 막음)', st.played === 2, `재생 ${st.played}회`);
+  check('[실시간] 번역 음성 2번만 재생 (같은 언어 되풀이·스피커 에코는 막음)', st.played === 2, `재생 ${st.played}회`);
+  check('[실시간] 에코 무시 기록', /실시간 에코 무시/.test(log), '');
   check('[실시간] 페이지 오류 없음', errors.length === 0, errors.join(' | '));
   process.stdout.write(`\n--- 실시간 모드 로그 ---\n${log}\n`);
+  await ctx.close();
+}
+
+/* ================= 3. 실시간 연결 실패 → 문장 모드 ================= */
+{
+  const { page, errors, ctx } = await newPage();
+  await page.route('https://generativelanguage.googleapis.com/**', (route) => route.fulfill({ json: MODELS }));
+  await page.routeWebSocket(/BidiGenerateContent/, (ws) => { ws.onMessage(() => ws.close({ code: 1008, reason: 'Quota exceeded' })); });
+  await page.goto(url);
+  await page.click('#btnSettings');
+  await page.fill('#key', 'AIza-test');
+  await page.click('#btnTest');
+  await page.waitForSelector('#keyStatus .ok', { timeout: 5000 });
+  await page.click('#btnCloseSheet');
+  await page.click('#btnMic');
+  await page.waitForTimeout(1500);
+  const log = await page.textContent('#log');
+  const status = await page.textContent('#statusSub');
+  check('[실패 대비] 실시간 연결 실패하면 문장 모드로 계속 들음', /실시간 모드 실패 → 문장 모드로 전환/.test(log) && /문장 모드 시작/.test(log) && await page.isVisible('#btnMic.on'), `${status} | ${log.split('\n').slice(0, 3).join(' / ')}`);
+  check('[실패 대비] 페이지 오류 없음', errors.length === 0, errors.join(' | '));
   await ctx.close();
 }
 

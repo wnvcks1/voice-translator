@@ -190,3 +190,15 @@ test('VAD: 마이크 재연결 직후 완전 무음 프레임이 와도 다음 �
   const dur = concat(end.frames).length / SR;
   assert.ok(dur < 2.4, `dur ${dur}`);
 });
+
+test('VAD: 말 끝나자 배경 소음이 커져도(폰 자동 음량) 문장이 끝남', () => {
+  // 조용한 방(-55dB) → 말 → 쉬는 틈에 AGC 가 소음을 -40dB 대로 키움. 바닥+6dB 기준만으론 영원히 '말하는 중'
+  const sig = concat([noise(1, 0.002), voice(130, 1.5, { amp: 0.5 }), noise(4, 0.012)]);
+  const ev = runVad(sig);
+  const end = ev.find((e) => e.type === 'end');
+  assert.ok(end, ev.map((e) => e.type).join(','));
+  const dur = concat(end.frames).length / SR;
+  assert.ok(dur < 3, `dur ${dur}`);
+  // 끝난 뒤 커진 소음을 새 말로 오인하지 않음
+  assert.equal(ev.filter((e) => e.type === 'start').length, 1, ev.map((e) => e.type).join(','));
+});
