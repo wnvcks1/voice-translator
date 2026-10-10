@@ -2,13 +2,13 @@
    문장 모드: 마이크 → VAD 로 한 마디 끊기 → Gemini(언어판별+받아쓰기+번역, 스트리밍) → 성별 판정 → TTS 재생
    실시간 모드(베타): 마이크 소리를 Gemini Live Translate 세션 2개에 계속 흘려보내고 번역 음성을 바로 재생 */
 
-import { startMic } from './audio.js';
+import { startMic, estimateGender } from './audio.js';
 import { interpret, listModels, pickModels, LANGS, AI_VOICES } from './gemini.js';
 import { Speaker, loadVoices } from './tts.js';
 import { LiveSession, PcmPlayer, scriptLang, SCRIPT_OF, EchoGuard } from './live.js';
 import { voiceFeatures, VoiceProfiles } from './voice.js';
 
-const VERSION = 'v0.4.1';
+const VERSION = 'v0.5';
 const $ = (id) => document.getElementById(id);
 const SKEY = 'dt-settings';
 
@@ -16,7 +16,7 @@ const DEFAULTS = {
   key: '', chatModel: '', chatList: [], ttsModel: '', liveModel: '', models: [], bidiModels: [],
   them: 'zh', aiVoice: false, aiVoiceMale: 'Charon', aiVoiceFemale: 'Kore',
   echoBlock: false, rate: 1, silenceMs: 700, maleMax: 160, femaleMin: 180, sens: 'normal',
-  liveMode: true, meGender: 'auto', themGender: 'auto', ver: 3,
+  liveMode: true, meGender: 'auto', themGender: 'auto', sideGender: {}, ver: 3,
 };
 
 /** @returns {object} 저장된 설정 */
@@ -414,10 +414,23 @@ async function startLive() {
   if (!S.liveModel) throw new Error('실시간 번역 모델 없음 — 설정에서 연결 확인을 다시 누르세요');
   const player = new PcmPlayer(() => speaker.audioCtx());
   const them = S.them;
+  S.sideGender = S.sideGender || {};
   // 세션별 상태: →상대언어 세션은 한국어 말을 받아 왼쪽 카드, →한국어 세션은 상대 말을 받아 오른쪽 카드
-  const blank = { inText: '', outText: '', card: null, mute: false, checked: false, voiceChecked: false, held: [], audio: [], holdTimer: 0, lastAt: 0, t0: 0, gotAudio: 0 };
-  const mk = (target, side, from, to, gender) => ({ target, side, from, to, gender, ...blank, held: [], audio: [] });
-  let lastUtter = null; // 방금 끝난 말의 소리·목소리 특징 (화자 학습용)
+  const blank = { inText: '', outText: '', card: null, mute: false, checked: false, voiceChecked: false, genderChecked: false, held: [], audio: [], holdTimer: 0, lastAt: 0, t0: 0, gotAudio: 0 };
+  const mk = (target, side, from, to, fixed) => ({
+    target, side, from, to, fixed, ...blank, held: [], audio: [],
+    // 번역 목소리 성별: 설정 고정값 → 지난 통화에서 기억한 이 쪽 사람 성별 → 없으면 모델 기본 목소리
+    voiceG: fixed !== 'auto' ? fixed : (S.sideGender[side] || null),
+    session: null, switching: false, pending: [], ownTts: false,
+  });
+  const st = {
+    out: mk(LANGS[them].bcp, 'left', 'ko', them, S.meGender),
+    ko: mk('ko-KR', 'right', them, 'ko', S.themGender),
+  };
+  const both = [st.out, st.ko];
+  let lastUtter = null; // 방금 끝난 말의 소리·목소리 특징 (화자 학습·성별 판정용)
+  let speechFrom = 0; // 지금(또는 방금) 말의 시작 시각 — 목소리 바꿀 때 그 말을 처음부터 다시 보냄
+  const ring = []; // 최근 12초 마이크 소리 [시각, 프레임]
   const play = (x, f, r) => { player.push(f, r); x.audio.push([f, r]); };
   const flush = (x) => {
     clearTimeout(x.holdTimer);
@@ -426,35 +439,54 @@ async function startLive() {
   };
   // 글자 종류로 이 세션 몫인지 확실한가 (한국어 ↔ 중국어는 항상 확실, 영어 ↔ 스페인어 같은 라틴끼리는 아님)
   const decisive = (x, lang) => lang && SCRIPT_OF[x.from] !== SCRIPT_OF[x.to] && (lang === SCRIPT_OF[x.from] || lang === SCRIPT_OF[x.to]);
-  const st = {
-    out: mk(LANGS[them].bcp, 'left', 'ko', them, S.meGender),
-    ko: mk('ko-KR', 'right', them, 'ko', S.themGender),
+  const genderName = (g) => (g === 'male' ? '남' : g === 'female' ? '여' : '기본');
+
+  /** 지금 말하는 사람의 성별: 이번 말 음높이 → 이 쪽 사람 누적 음높이 */
+  const speakerGender = (x) => {
+    if (x.fixed !== 'auto') return x.fixed;
+    const cur = mic?.currentSpeech();
+    const pcm = cur && cur.length > 16000 * 0.5 ? cur : lastUtter?.pcm;
+    const g = pcm ? reGender(estimateGender(pcm, 16000)).gender : 'unknown';
+    if (g !== 'unknown') return g;
+    const f0 = voices.pitch(x.side);
+    return f0 ? (f0 <= S.maleMax ? 'male' : f0 >= S.femaleMin ? 'female' : 'unknown') : 'unknown';
   };
+
   const finish = (x) => {
     // 보류 중이던 번역 소리를 먼저 내보내야 '다시 듣기'에도 담김
-    if (!x.mute) flush(x);
+    if (!x.mute && !x.ownTts) flush(x);
     if (x.card && (x.inText || x.outText)) {
       x.card.el.classList.remove('pending');
-      const turn = { id: ++seq, lang: x.from, src: x.inText.trim(), dst: x.outText.trim(), toLang: x.to, gender: x.gender === 'auto' ? 'female' : x.gender };
+      const turn = { id: ++seq, lang: x.from, src: x.inText.trim(), dst: x.outText.trim(), toLang: x.to, gender: x.voiceG || 'female' };
       lastTurn = turn;
       $('btnShow').disabled = false;
       // 글자로 쪽이 확실한 말이면 방금 끝난 말소리로 이 쪽 목소리를 배움
       const learned = decisive(x, scriptLang(turn.src)) && lastUtter && performance.now() - lastUtter.at < 8000;
       if (learned) { voices.learn(x.side, lastUtter.feat); lastUtter = null; }
-      const lat = x.gotAudio ? `첫 소리 ${((x.gotAudio - x.t0) / 1000).toFixed(1)}s` : '소리 없음';
-      x.card.meta.textContent = `실시간 · ${lat}`;
+      // 모델이 목소리 지정을 안 받으면 번역 글을 앱 음성(성별 맞춤)으로 읽음
+      if (x.ownTts && turn.dst) {
+        echo.add(turn.dst, turn.toLang);
+        speaker.say(turn.dst, LANGS[turn.toLang].bcp, turn.gender)
+          .then((h) => log(`실시간 앱 음성 ${h.engine} ${h.status} [${h.voice}]`));
+      }
+      const lat = x.gotAudio ? `첫 소리 ${((x.gotAudio - x.t0) / 1000).toFixed(1)}s` : x.ownTts ? '앱 음성' : '소리 없음';
+      x.card.meta.textContent = `실시간 · ${turn.gender === 'male' ? '♂' : '♀'} · ${lat}`;
       const audio = x.audio.slice();
-      if (audio.length) {
+      if (audio.length || x.ownTts) {
         const again = document.createElement('button');
         again.textContent = '🔊 다시';
-        again.onclick = () => { echo.add(turn.dst, turn.toLang); for (const [f, r] of audio) player.push(f, r); };
+        again.onclick = () => {
+          echo.add(turn.dst, turn.toLang);
+          if (audio.length) for (const [f, r] of audio) player.push(f, r);
+          else speaker.say(turn.dst, LANGS[turn.toLang].bcp, turn.gender);
+        };
         x.card.meta.append(' ', again);
       }
       const big = document.createElement('button');
       big.textContent = '🔍 크게';
       big.onclick = () => openShow(turn);
       x.card.meta.append(' ', big);
-      log(`실시간 ${x.from}→${x.to} | ${lat} | "${turn.src.slice(0, 30)}" → "${turn.dst.slice(0, 30)}"${learned ? ' | 목소리 학습' : ''}`);
+      log(`실시간 ${x.from}→${x.to} | ${lat} | 목소리 ${genderName(x.voiceG)} | "${turn.src.slice(0, 30)}" → "${turn.dst.slice(0, 30)}"${learned ? ' | 목소리 학습' : ''}`);
     } else if (x.card) x.card.el.remove();
     clearTimeout(x.holdTimer);
     Object.assign(x, { ...blank, held: [], audio: [] });
@@ -468,8 +500,47 @@ async function startLive() {
     x.lastAt = performance.now();
     return x.card;
   };
-  const handlers = (x) => ({
+
+  /**
+   * 번역 목소리 성별 바꾸기: 새 목소리로 세션을 다시 열고, 지금 말을 처음부터 다시 보냄. 옛 세션 출력은 버림.
+   * 쪽마다 처음 한 번(또는 그 쪽 사람이 바뀔 때)만 일어남.
+   */
+  const switchVoice = async (x, g) => {
+    const old = x.session;
+    const prevG = x.voiceG;
+    log(`목소리 맞춤: →${x.target} ${genderName(prevG)} → ${genderName(g)} (말한 사람 음높이 기준, 이번 말 다시 번역)`);
+    x.voiceG = g;
+    x.switching = true;
+    x.pending = ring.filter(([t]) => t >= speechFrom).map(([, f]) => f);
+    // 옛 목소리로 나온 이번 말 결과는 지우고 새로 받음 (카드는 유지)
+    x.inText = ''; x.outText = ''; x.held = []; x.audio = []; x.gotAudio = 0; clearTimeout(x.holdTimer); x.holdTimer = 0;
+    x.checked = false;
+    if (x.card) { x.card.src.textContent = ''; x.card.dst.textContent = ''; }
+    const s2 = makeSession(x, g);
+    x.session = s2; // 이 순간부터 옛 세션 메시지는 무시됨
+    try {
+      await s2.connect();
+      for (const f of x.pending) s2.send(f);
+      x.lastAt = performance.now(); // 새 세션이 다시 번역하는 동안 카드가 시간 초과로 닫히지 않게
+      if (!s2.voiceApplied) {
+        x.ownTts = true;
+        log(`실시간 모델이 목소리 지정을 안 받음 → →${x.target} 번역은 글로 받아 앱 음성(${genderName(g)})으로 읽음`);
+      }
+      old?.close();
+    } catch (e) {
+      log(`목소리 바꾸기 실패, 이전 목소리 유지: ${e.message}`);
+      x.session = old;
+      x.voiceG = prevG;
+      for (const f of x.pending) old?.send(f);
+    } finally {
+      x.pending = [];
+      x.switching = false;
+    }
+  };
+
+  const handlers = (x, me) => ({
     onIn: (t) => {
+      if (x.session !== me) return;
       x.inText += t;
       // 이미 목표 언어인 말(예: →한국어 세션이 한국어를 들음)은 이 세션 몫이 아님 → 소리·글 무시
       const lang = scriptLang(x.inText);
@@ -496,33 +567,51 @@ async function startLive() {
       if (x.mute) return;
       ensureCard(x).src.textContent = x.inText;
       x.card.el.scrollIntoView({ block: 'end' });
+      // 이 세션이 번역할 말로 확인됨 → 말한 사람 성별에 번역 목소리를 맞춤
+      if (!x.genderChecked && decisive(x, lang) && lang === SCRIPT_OF[x.from]) {
+        x.genderChecked = true;
+        const g = speakerGender(x);
+        if (g !== 'unknown') {
+          if (S.sideGender[x.side] !== g) { S.sideGender[x.side] = g; save(); }
+          if (g !== x.voiceG && !x.switching) { switchVoice(x, g); return; }
+        }
+      }
       // 에코가 아님이 확인될 만큼 글자가 모이면 보류해 둔 번역 소리를 내보냄
-      if (!x.checked && x.inText.replace(/[\s\p{P}]/gu, '').length >= 4) { x.checked = true; flush(x); }
+      if (!x.checked && x.inText.replace(/[\s\p{P}]/gu, '').length >= 4) { x.checked = true; if (!x.ownTts) flush(x); }
     },
     onOut: (t) => {
-      if (x.mute) return;
+      if (x.session !== me || x.mute) return;
       x.outText += t;
       echo.add(x.outText, x.to);
       ensureCard(x).dst.textContent = x.outText;
       x.card.el.scrollIntoView({ block: 'end' });
     },
     onAudio: (f, rate) => {
-      if (x.mute) return;
+      if (x.session !== me || x.mute || x.ownTts) return;
       ensureCard(x);
       if (!x.gotAudio) x.gotAudio = performance.now();
       if (x.checked) { play(x, f, rate); return; }
-      // 들은 말 글자가 아직 없으면 에코인지 모름 → 최대 1.2초 보류 후 재생
+      // 들은 말 글자가 아직 없으면 에코·목소리 성별을 모름 → 최대 1.2초 보류 후 재생
       x.held.push([f, rate]);
-      if (!x.holdTimer) x.holdTimer = setTimeout(() => { if (!x.mute) { x.checked = true; flush(x); } }, 1200);
+      if (!x.holdTimer) x.holdTimer = setTimeout(() => { if (!x.mute && x.session === me) { x.checked = true; flush(x); } }, 1200);
     },
-    onTurnEnd: () => finish(x),
+    onTurnEnd: () => { if (x.session === me) finish(x); },
   });
-  const sessions = [];
-  const open = (x) => {
+
+  /**
+   * @param {object} x 세션 상태
+   * @param {string|null} g 번역 목소리 성별
+   * @returns {LiveSession}
+   */
+  function makeSession(x, g) {
     const s = new LiveSession({
-      key: S.key, model: S.liveModel, target: x.target, voice: liveVoice(x.gender), log,
-      ...handlers(x),
+      key: S.key, model: S.liveModel, target: x.target, voice: liveVoice(g), log,
+      onIn: (t) => handlers(x, s).onIn(t),
+      onOut: (t) => handlers(x, s).onOut(t),
+      onAudio: (f, r) => handlers(x, s).onAudio(f, r),
+      onTurnEnd: () => handlers(x, s).onTurnEnd(),
       onDead: async (why) => {
+        if (x.session !== s) return;
         log(`${s.name} 끊김 ${why}`);
         if (!live) return;
         // 세션 수명 제한(약 10~15분) 등으로 끊기면 한 번 다시 연결
@@ -532,22 +621,27 @@ async function startLive() {
         }
       },
     });
-    sessions.push(s);
-    return s.connect();
-  };
+    return s;
+  }
+
   setStatus('실시간 번역 연결 중…', S.liveModel);
   live = {
     stop() {
       clearInterval(this.timer);
-      sessions.forEach((s) => s.close());
+      both.forEach((x) => x.session?.close());
       player.stop();
       finish(st.out); finish(st.ko);
     },
   };
-  await Promise.all([open(st.out), open(st.ko)]);
+  await Promise.all(both.map((x) => {
+    x.session = makeSession(x, x.voiceG);
+    return x.session.connect().then(() => {
+      if (x.voiceG && !x.session.voiceApplied) x.ownTts = true;
+    });
+  }));
   // turnComplete 가 안 오는 경우 대비: 3초 동안 새 글자가 없으면 카드 마감
   live.timer = setInterval(() => {
-    for (const x of [st.out, st.ko]) if (x.card && performance.now() - x.lastAt > 3000 && !player.playing) finish(x);
+    for (const x of both) if (x.card && !x.switching && performance.now() - x.lastAt > 3000 && !player.playing) finish(x);
   }, 500);
 
   let gated = false;
@@ -555,18 +649,25 @@ async function startLive() {
     vad: vadCfg(),
     log,
     onLevel: showLevel,
-    // 실시간 모드에선 번역 요청엔 안 쓰고, 화자 학습용 목소리 특징만 계산
+    onSpeechStart: () => { speechFrom = performance.now() - 450; },
+    // 실시간 모드에선 번역 요청엔 안 쓰고, 화자 학습·성별 판정용으로만 씀
     onUtterance: (u) => { lastUtter = { pcm: u.pcm, feat: voiceFeatures(u.pcm, 16000), at: performance.now() }; },
     onFrame: (f) => {
+      const now = performance.now();
+      ring.push([now, f]);
+      while (ring.length && now - ring[0][0] > 12000) ring.shift();
       // 기본은 전화처럼 재생 중에도 계속 들음. '에코 막기'를 켜면 재생 동안 무음을 보냄
       const gate = S.echoBlock && player.playing;
       if (gate !== gated) { gated = gate; setStatus(gate ? '🔊 번역 음성 재생 중' : '듣는 중… 그냥 말하면 바로 번역됨'); }
       const out = gate ? new Float32Array(f.length) : f;
-      for (const s of sessions) s.send(out);
+      for (const x of both) {
+        if (x.switching) x.pending.push(out);
+        else x.session?.send(out);
+      }
     },
   });
   setStatus('듣는 중… 그냥 말하면 바로 번역됨', `실시간 모드 · ${shortModel(S.liveModel)}`);
-  log(`실시간 모드 시작: ${S.liveModel}, 세션 2개 (→${LANGS[them].bcp}, →ko-KR)`);
+  log(`실시간 모드 시작: ${S.liveModel}, 세션 2개 (→${LANGS[them].bcp} 목소리 ${genderName(st.out.voiceG)}, →ko-KR 목소리 ${genderName(st.ko.voiceG)})`);
 }
 
 /**

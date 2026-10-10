@@ -159,6 +159,7 @@ export class LiveSession {
     this.ready = false;
     this.closing = false;
     this.variant = 0;
+    this.voiceApplied = false;
     this.buf = [];
     this.bufLen = 0;
     this.name = `→${o.target}`;
@@ -183,6 +184,8 @@ export class LiveSession {
         } catch { return; }
         if (msg.setupComplete) {
           this.ready = true;
+          // 목소리를 요청했는데 목소리 없는 형식으로만 연결됐다면 이 모델은 목소리 지정을 안 받는 것
+          this.voiceApplied = !!(v.voice && this.o.voice);
           this.o.log(`${this.name} 연결됨 (설정 ${v.placement}${v.voice && this.o.voice ? `, 목소리 ${this.o.voice}` : ''})`);
           if (!settled) { settled = true; resolve(); }
           return;

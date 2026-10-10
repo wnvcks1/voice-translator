@@ -5,6 +5,7 @@ import { readFile, mkdir } from 'node:fs/promises';
 import { join, dirname, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execSync } from 'node:child_process';
+import { estimateGender, rmsDb, concat } from '../audio.js';
 
 // 로컬 설치가 없으면 전역 playwright 사용 (이 저장소는 의존성 설치 없이 돌게 유지)
 let chromium;
@@ -44,8 +45,12 @@ async function newPage(o = {}) {
     window.__gum = 0;
     window.__stops = 0;
     window.__played = 0;
+    window.__playedVals = [];
     const origStart = AudioBufferSourceNode.prototype.start;
-    AudioBufferSourceNode.prototype.start = function (...a) { if (this.buffer?.duration > 0.05) window.__played++; return origStart.apply(this, a); };
+    AudioBufferSourceNode.prototype.start = function (...a) {
+      if (this.buffer?.duration > 0.05) { window.__played++; window.__playedVals.push(Math.round(this.buffer.getChannelData(0)[0] * 10) / 10); }
+      return origStart.apply(this, a);
+    };
 
     let src = null;
     navigator.mediaDevices.getUserMedia = async () => {
@@ -53,7 +58,7 @@ async function newPage(o = {}) {
       if (!src) {
         const ac = new AudioContext();
         const SR = ac.sampleRate;
-        const seg = [[1.5, 0], [1.6, 120], [3.0, 0], [1.6, 220], [3.0, 0], [1.6, 122], [8, 0]];
+        const seg = [[1.5, 0], [1.6, 120], [3.0, 0], [1.6, 220], [3.0, 0], [0.8, 122], [8, 0]];
         const total = seg.reduce((s, [d]) => s + d, 0);
         const buf = ac.createBuffer(1, Math.round(SR * total), SR);
         const ch = buf.getChannelData(0);
@@ -201,62 +206,89 @@ const MODELS = {
 }
 
 /* ================= 2. 실시간 모드 ================= */
-{
-  const { page, errors, ctx } = await newPage();
-  await page.route('https://generativelanguage.googleapis.com/**', (route) => route.fulfill({ json: MODELS }));
+/**
+ * Live API 흉내: 받은 소리를 실제로 듣고(음량으로 말 구간, 음높이로 화자) 말이 끝나면 대답함.
+ * 앱이 목소리를 바꾸려고 세션을 새로 열고 이번 말을 다시 보내도 그대로 동작해야 하므로 시간이 아니라 소리 내용으로 응답.
+ * 번역 소리의 첫 샘플 값으로 어떤 목소리로 나왔는지 표시: 남(Charon)=0.1, 여(Kore)=0.2, 기본=0.3
+ *   남 1.2초 이상 = 한국어 "이거 얼마예요?", 남 짧은 말 = "OK", 여 = 중국어 "这个三十块。"
+ * @param {{rejectVoice?:boolean}} o
+ */
+function liveMock(o = {}) {
   const setups = [];
   const counts = {};
-  await page.routeWebSocket(/BidiGenerateContent/, (ws) => {
-    let target = null;
-    let n = 0;
-    const sc = (o) => ws.send(JSON.stringify({ serverContent: o }));
-    const pcm = Buffer.alloc(24000 * 0.5 * 2).toString('base64');
+  const handler = (ws) => {
+    let target = null, voice = null;
+    let seg = [], inSeg = false, quiet = 0, acc = [];
+    const sc = (x) => ws.send(JSON.stringify({ serverContent: x }));
+    const mark = { Charon: 0.1, Kore: 0.2 };
+    const audio = () => {
+      const v = Math.round((voice ? mark[voice] ?? 0.3 : 0.3) * 32767);
+      const b = Buffer.alloc(24000 * 0.5 * 2);
+      for (let i = 0; i < b.length; i += 2) b.writeInt16LE(v, i);
+      return { modelTurn: { parts: [{ inlineData: { mimeType: 'audio/pcm;rate=24000', data: b.toString('base64') } }] } };
+    };
+    const respond = (pcm) => {
+      const dur = pcm.length / 16000;
+      const g = estimateGender(pcm, 16000);
+      if (g.gender === 'female') {
+        if (target === 'ko-KR') {
+          sc(audio()); // 번역 소리가 들은 글자보다 먼저 오는 경우
+          sc({ inputTranscription: { text: '这个三十块。' } });
+          sc({ outputTranscription: { text: '이건 30위안이에요.' } });
+        } else sc({ inputTranscription: { text: '这个三十块。' } });
+      } else if (dur >= 1.2) {
+        sc({ inputTranscription: { text: '이거 ' } });
+        sc({ inputTranscription: { text: '얼마예요?' } });
+        if (target === 'zh-CN') sc({ outputTranscription: { text: '这个多少钱？' }, ...audio() });
+        else {
+          // echo 를 꺼도 같은 언어 소리가 오면 앱이 막아야 함
+          sc({ outputTranscription: { text: '이거 얼마예요?' }, ...audio() });
+          sc({ turnComplete: true });
+          // 스피커로 나간 '这个多少钱？' 가 마이크로 되들어온 상황
+          setTimeout(() => { sc({ inputTranscription: { text: '这个多少钱' } }); sc({ outputTranscription: { text: '이거 얼마예요' }, ...audio() }); sc({ turnComplete: true }); }, 400);
+          return;
+        }
+      } else {
+        // 글자로는 누구 말인지 모름 → 두 세션 다 번역해 보냄. 앱이 목소리로 한쪽만 남겨야 함
+        sc({ inputTranscription: { text: 'OK' } });
+        sc({ outputTranscription: { text: target === 'zh-CN' ? '好的' : '알겠어요' }, ...audio() });
+      }
+      sc({ turnComplete: true });
+    };
     ws.onMessage((m) => {
       const msg = JSON.parse(m);
       if (msg.setup) {
+        const gc = msg.setup.generationConfig;
+        if (o.rejectVoice && gc.speechConfig) { ws.close({ code: 1007, reason: 'Invalid JSON payload received. Unknown name "speechConfig"' }); return; }
         setups.push(msg.setup);
-        target = (msg.setup.generationConfig.translationConfig || msg.setup.translationConfig).targetLanguageCode;
+        target = (gc.translationConfig || msg.setup.translationConfig).targetLanguageCode;
+        voice = gc.speechConfig?.voiceConfig.prebuiltVoiceConfig.voiceName || null;
         ws.send(JSON.stringify({ setupComplete: {} }));
         return;
       }
       if (!msg.realtimeInput) return;
-      n++;
-      counts[target] = n;
-      // 가짜 마이크: 남 1.5~3.1초, 여 6.1~7.7초. 실제 Live API 처럼 말이 끝난 뒤(4초·9초) 턴 완료
-      if (n === 40) {
-        sc({ inputTranscription: { text: '이거 ' } });
-        sc({ inputTranscription: { text: '얼마예요?' } });
-        if (target === 'zh-CN') {
-          sc({ outputTranscription: { text: '这个多少钱？' }, modelTurn: { parts: [{ inlineData: { mimeType: 'audio/pcm;rate=24000', data: pcm } }] } });
-        } else {
-          // echo 를 꺼도 혹시 같은 언어 소리가 오면 앱이 막아야 함
-          sc({ outputTranscription: { text: '이거 얼마예요?' }, modelTurn: { parts: [{ inlineData: { mimeType: 'audio/pcm;rate=24000', data: pcm } }] } });
+      counts[target] = (counts[target] || 0) + 1;
+      const b = Buffer.from(msg.realtimeInput.audio.data, 'base64');
+      for (let i = 0; i + 1 < b.length; i += 2) acc.push(b.readInt16LE(i) / 32768);
+      while (acc.length >= 1600) {
+        const blk = Float32Array.from(acc.splice(0, 1600));
+        const loud = rmsDb(blk) > -35;
+        if (loud) { inSeg = true; quiet = 0; seg.push(blk); } else if (inSeg) {
+          seg.push(blk);
+          if (++quiet >= 7) { const pcm = concat(seg.slice(0, -7)); inSeg = false; seg = []; quiet = 0; respond(pcm); }
         }
-        sc({ turnComplete: true });
-      }
-      if (n === 55 && target === 'ko-KR') {
-        // 스피커로 나간 '这个多少钱？' 가 마이크로 되들어온 상황 → 앱이 걸러야 함
-        sc({ inputTranscription: { text: '这个多少钱' } });
-        sc({ outputTranscription: { text: '이거 얼마예요' }, modelTurn: { parts: [{ inlineData: { mimeType: 'audio/pcm;rate=24000', data: pcm } }] } });
-        sc({ turnComplete: true });
-      }
-      if (n === 125) {
-        // 세 번째 말(첫 번째 남자가 다시, 122Hz)은 'OK' — 글자로는 누구 말인지 모름. 두 세션 다 번역해 보냄 → 앱이 목소리로 한쪽만 남겨야 함
-        sc({ inputTranscription: { text: 'OK' } });
-        sc({ outputTranscription: { text: target === 'zh-CN' ? '好的' : '알겠어요' }, modelTurn: { parts: [{ inlineData: { mimeType: 'audio/pcm;rate=24000', data: pcm } }] } });
-        sc({ turnComplete: true });
-      }
-      if (n === 90) {
-        if (target === 'ko-KR') {
-          // 번역 소리가 들은 글자보다 먼저 도착 → 보류했다가 확인 후 재생
-          sc({ modelTurn: { parts: [{ inlineData: { mimeType: 'audio/pcm;rate=24000', data: pcm } }] } });
-        }
-        sc({ inputTranscription: { text: '这个三十块。' } });
-        if (target === 'ko-KR') sc({ outputTranscription: { text: '이건 30위안이에요.' } });
-        sc({ turnComplete: true });
       }
     });
-  });
+  };
+  return { setups, counts, handler };
+}
+
+{
+  const { page, errors, ctx } = await newPage();
+  await page.route('https://generativelanguage.googleapis.com/**', (route) => route.fulfill({ json: MODELS }));
+  const mock = liveMock();
+  const { setups, counts } = mock;
+  await page.routeWebSocket(/BidiGenerateContent/, mock.handler);
 
   await page.goto(url);
   await page.click('#btnSettings');
@@ -280,25 +312,66 @@ const MODELS = {
   await page.waitForFunction(() => document.querySelectorAll('.turn:not(.pending)').length >= 3, null, { timeout: 15000 }).catch(() => {});
   await page.waitForTimeout(1500);
   await page.screenshot({ path: join(out, 'l2-live-ok.png') });
-  const turns = await page.$$eval('.turn', (els) => els.map((e) => ({ cls: e.className, src: e.querySelector('.src').textContent, dst: e.querySelector('.dst').textContent })));
-  const st = await page.evaluate(() => ({ played: window.__played }));
+  const turns = await page.$$eval('.turn', (els) => els.map((e) => ({ cls: e.className, src: e.querySelector('.src').textContent, dst: e.querySelector('.dst').textContent, meta: e.querySelector('.meta').textContent })));
+  const st = await page.evaluate(() => ({ played: window.__played, vals: window.__playedVals }));
+  const saved = await page.evaluate(() => JSON.parse(localStorage.getItem('dt-settings')).sideGender);
   const log = await page.textContent('#log');
 
+  const first = setups.slice(0, 2);
+  check('[실시간] 처음 세션 2개 (→zh-CN, →ko-KR), echo 끔, 전사 켬, 기억된 성별 없으면 목소리 미지정', first.length === 2 && first.every((s) => s.inputAudioTranscription && s.outputAudioTranscription && !s.generationConfig.speechConfig)
+    && first.map((s) => s.generationConfig.translationConfig?.targetLanguageCode).sort().join() === 'ko-KR,zh-CN'
+    && first.every((s) => s.generationConfig.translationConfig.echoTargetLanguage === false), JSON.stringify(first));
+  const later = setups.slice(2).map((s) => `${s.generationConfig.translationConfig.targetLanguageCode}:${s.generationConfig.speechConfig?.voiceConfig.prebuiltVoiceConfig.voiceName}`);
+  check('[목소리] 남자가 한국어로 말하면 →중국어 세션을 남자 목소리로, 여자가 중국어로 말하면 →한국어 세션을 여자 목소리로 다시 엶', later.join() === 'zh-CN:Charon,ko-KR:Kore', later.join());
+  check('[목소리] 번역 소리: 한국어→중국어 남자, 중국어→한국어 여자, OK→중국어 남자 (기본 목소리 소리는 안 나감)', JSON.stringify(st.vals) === '[0.1,0.2,0.1]', JSON.stringify(st.vals));
+  check('[목소리] 쪽마다 성별 기억 (다음 통화부터 바로 맞는 목소리)', saved?.left === 'male' && saved?.right === 'female', JSON.stringify(saved));
+  check('[목소리] 카드에 성별 표시', /♂/.test(turns[0]?.meta || '') && /♀/.test(turns[1]?.meta || ''), turns.map((t) => t.meta).join(' / '));
   check('[분류] 글자로 애매한 "OK" 는 목소리로 내 말 판정 → 왼쪽 카드 하나만', turns.length === 3 && turns[2].cls.includes('left') && turns[2].dst === '好的' && /화자 판정: "OK" 은 내 목소리/.test(log), `${JSON.stringify(turns[2])} | ${(log.match(/화자 판정.*/) || ['판정 기록 없음'])[0]}`);
-  check('[실시간] 세션 2개 (→zh-CN, →ko-KR), echo 끔, 전사 켬', setups.length === 2 && setups.every((s) => s.inputAudioTranscription && s.outputAudioTranscription)
-    && setups.map((s) => s.generationConfig.translationConfig?.targetLanguageCode).sort().join() === 'ko-KR,zh-CN'
-    && setups.every((s) => s.generationConfig.translationConfig.echoTargetLanguage === false), JSON.stringify(setups));
-  check('[실시간] 목소리 자동이면 speechConfig 없음', setups.every((s) => !s.generationConfig.speechConfig));
   check('[실시간] 마이크 소리를 두 세션에 모두 보냄', counts['zh-CN'] >= 90 && counts['ko-KR'] >= 90, JSON.stringify(counts));
   check('[통화] 음소거 중엔 안 보내고, 풀면 다시 보냄', mutedGrowth <= 1 && resumed >= 5, `음소거 중 +${mutedGrowth}, 해제 후 +${resumed}`);
   check('[실시간] 확실한 말로 양쪽 목소리 학습', (log.match(/목소리 학습/g) || []).length === 2, (log.match(/실시간 .*/g) || []).join(' / '));
   check('[실시간] 카드마다 🔊 다시 (보류됐던 소리도 저장)', (await page.$$eval('.turn', (els) => els.filter((e) => /다시/.test(e.querySelector('.meta').textContent)).length)) === 3);
-  check('[실시간] 한국어 → 왼쪽 카드', turns[0].cls.includes('left') && turns[0].src === '이거 얼마예요?' && turns[0].dst === '这个多少钱？', JSON.stringify(turns));
+  check('[실시간] 한국어 → 왼쪽 카드 (다시 번역해도 글자 안 겹침)', turns[0]?.cls.includes('left') && turns[0].src === '이거 얼마예요?' && turns[0].dst === '这个多少钱？', JSON.stringify(turns));
   check('[실시간] 중국어 → 오른쪽 카드', turns[1]?.cls.includes('right') && turns[1].src === '这个三十块。' && turns[1].dst === '이건 30위안이에요.', JSON.stringify(turns[1]));
-  check('[실시간] 번역 음성 3번만 재생 (같은 언어 되풀이·스피커 에코·상대 쪽 OK 는 막음)', st.played === 3, `재생 ${st.played}회`);
+  check('[실시간] 번역 음성 3번만 재생 (같은 언어 되풀이·스피커 에코·상대 쪽 OK·옛 목소리는 막음)', st.played === 3, `재생 ${st.played}회`);
   check('[실시간] 에코 무시 기록', /실시간 에코 무시/.test(log), '');
   check('[실시간] 페이지 오류 없음', errors.length === 0, errors.join(' | '));
   process.stdout.write(`\n--- 실시간 모드 로그 ---\n${log}\n`);
+
+  // 같은 브라우저로 다시 통화: 기억한 성별로 처음부터 맞는 목소리
+  const n0 = setups.length;
+  await page.click('#btnMic');
+  await page.click('#btnMic');
+  await page.waitForTimeout(1500);
+  const again = setups.slice(n0).map((s) => `${s.generationConfig.translationConfig.targetLanguageCode}:${s.generationConfig.speechConfig?.voiceConfig.prebuiltVoiceConfig.voiceName}`).sort();
+  check('[목소리] 두 번째 통화는 처음부터 기억한 목소리로 연결', again.join() === 'ko-KR:Kore,zh-CN:Charon', again.join());
+  await ctx.close();
+}
+
+/* ================= 2-b. 모델이 목소리 지정을 거부하면 앱 음성으로 ================= */
+{
+  const { page, errors, ctx } = await newPage();
+  await page.route('https://generativelanguage.googleapis.com/**', (route) => route.fulfill({ json: MODELS }));
+  const mock = liveMock({ rejectVoice: true });
+  await page.routeWebSocket(/BidiGenerateContent/, mock.handler);
+  await page.goto(url);
+  await page.click('#btnSettings');
+  await page.fill('#key', 'AIza-test');
+  await page.click('#btnTest');
+  await page.waitForSelector('#keyStatus .ok', { timeout: 5000 });
+  await page.click('#btnCloseSheet');
+  await page.click('#btnMic');
+  await page.waitForFunction(() => document.querySelectorAll('.turn:not(.pending)').length >= 2, null, { timeout: 25000 }).catch(() => {});
+  await page.waitForTimeout(1000);
+  const spoken = await page.evaluate(() => window.__spoken);
+  const vals = await page.evaluate(() => window.__playedVals);
+  const log = await page.textContent('#log');
+  const zh = spoken.find((x) => x.lang === 'zh-CN');
+  const ko = spoken.find((x) => x.lang === 'ko-KR');
+  check('[목소리 미지원] 모델이 목소리 지정을 거부하면 번역 글을 앱 음성으로 성별 맞춰 읽음', /목소리 지정을 안 받음/.test(log) && zh?.text === '这个多少钱？' && zh.pitch < 1 && ko?.text === '이건 30위안이에요.' && ko.pitch > 1,
+    `${JSON.stringify(spoken)} | ${(log.match(/목소리 지정.*/) || [''])[0]}`);
+  check('[목소리 미지원] 모델 기본 목소리 소리는 안 나감', vals.length === 0, JSON.stringify(vals));
+  check('[목소리 미지원] 페이지 오류 없음', errors.length === 0, errors.join(' | '));
   await ctx.close();
 }
 
